@@ -27,7 +27,7 @@ export function Lobby({ initialCode }: { initialCode?: string }) {
     threeCardCompare: 'FULL_HAND' as RoomRules['threeCardCompare'],
     muflisApproval: 'ADMIN' as RoomRules['muflisApproval'],
     counterMultiplier: 3,
-    blindPlaysHalf: true,
+    seenMultiple: 2,
     disputeWindowSeconds: 15,
     startingChips: 5000,
     rankingProfileId: 'house-default',
@@ -62,7 +62,7 @@ export function Lobby({ initialCode }: { initialCode?: string }) {
             threeCardCompare: form.threeCardCompare,
             muflisApproval: form.muflisApproval,
             counterMultiplier: form.counterMultiplier,
-            blindPlaysHalf: form.blindPlaysHalf,
+            seenMultiple: form.seenMultiple,
             disputeWindowSeconds: form.disputeWindowSeconds,
             startingChips: form.startingChips,
           },
@@ -242,6 +242,16 @@ export function Lobby({ initialCode }: { initialCode?: string }) {
               min={2}
               value={form.counterMultiplier}
               onChange={(e) => setForm({ ...form, counterMultiplier: Number(e.target.value) })}
+            />
+          </label>
+
+          <label className="field">
+            <span>Seen player pays level ×</span>
+            <input
+              type="number"
+              min={1}
+              value={form.seenMultiple}
+              onChange={(e) => setForm({ ...form, seenMultiple: Number(e.target.value) })}
             />
           </label>
 

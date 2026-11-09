@@ -229,8 +229,8 @@ Room rules (editable by the administrator, applied to **subsequent** rounds):
 | `dealingMode` | `THREE_CARD` | `THREE_CARD` / `TWO_CARD_ASSUMED` / `ONE_CARD_SHARED` |
 | `threeCardCompare` | `FULL_HAND` | `FULL_HAND` or `HIGHEST_CARD` (never inferred) |
 | `muflisApproval` | `ADMIN` | `ADMIN` or `UNANIMOUS` (all active players) |
-| `counterMultiplier` | 3 | A counter multiplies the seen stake by this |
-| `blindPlaysHalf` | true | Blind player pays half; the next seen player therefore pays double |
+| `counterMultiplier` | 3 | A counter pays level × this and raises the level to it |
+| `seenMultiple` | 2 | A seen player pays level × this |
 | `disputeWindowSeconds` | 15 | Provisional-result window before auto settlement |
 | `remainderRule` | `LOWEST_SEAT` | Who gets an indivisible remainder on a split |
 | `maxBetsPerRound` | 24 | Safety valve: hands are opened at the cap (0 = off) |
@@ -238,15 +238,37 @@ Room rules (editable by the administrator, applied to **subsequent** rounds):
 
 ### Betting model
 
-- `stake` = what a **seen** player must put to chaal.
-- `blindStake` = `ceil(stake / 2)` while `blindPlaysHalf` is on. A blind player
-  putting the blind stake forces the next seen player to put `stake` = **double**.
-- A blind player may also **raise**; their raise sets `stake = 2 × amount`.
-- **Counter** is only legal after at least one bet in the round; it sets
-  `stake = stake × counterMultiplier`, so *the next player has to put three
-  times* (default).
-- `SEE_CARDS` does not consume the turn; `CHAAL`, `RAISE`, `COUNTER` and `FOLD`
-  do.
+The round tracks the **bet level** (what a blind player puts to pass), the
+**last bet** (what the previous player actually paid) and whether that player
+was **blind**.
+
+| Situation | Pays | Effect |
+| --- | --- | --- |
+| Blind player, previous bet was blind (or first bet) | `level` | a **blind pass** — you match, nothing changes |
+| Seen player | `level × seenMultiple` (2) — **double** | the level is unchanged, `lastBet` becomes that amount |
+| Blind player right after a **seen** bet | the **last bet amount** | it is a **counter**: from then on `level = counterAmount × 3` |
+| Explicit counter (any player) | at least your normal requirement | same tripling rule |
+| Raise | any amount above the requirement | becomes the new level |
+
+Counters and raises keep repeating, so the level keeps climbing.
+
+Worked example (boot 10, `seenMultiple = 2`, `counterMultiplier = 3`):
+
+| Bet | Player | Pays | Level after | Seen plays now |
+| --- | --- | --- | --- | --- |
+| 1 | blind | 10 (pass) | 10 | 20 |
+| 2 | blind | 10 (pass) | 10 | 20 |
+| 3 | blind | 10 (pass) | 10 | 20 |
+| 4 | seen | 20 (double) | 20 | 20 |
+| 5 | blind → counter | 20 (the current bet) | **60** (3 × 20) | **60** — not 120 |
+| 6 | seen | 60 (match) | 60 | 60 |
+| 7 | seen | 60 (match) | 60 | 60 |
+| 8 | blind → counter | 60 | 180 | 180 |
+
+The doubling only applies while the betting is still blind. Once a seen bet (or a
+counter) has been made, everyone matches the level, so a counter is exactly ×3.
+
+`SEE_CARDS` does not consume the turn; `CHAAL`, `RAISE`, `COUNTER` and `FOLD` do.
 
 ### Round state machine
 
@@ -261,10 +283,35 @@ Every transition is persisted; actions that belong to another state are refused.
 
 ## 5. Showdown
 
-Two active players per show (MVP). The initiator is stored **server side** when
-the show is requested — never inferred from message order.
+### Blind play
 
-Evaluation order:
+Your own cards are **not shown at the deal** — server-side, your view contains
+face-down placeholders until you press **See cards** (`SEE_CARDS`). That is what
+makes blind play real: `blind` only halves your stake, and you cannot choose an
+assumed card for a hand you have not looked at (`SEE_CARDS_FIRST`).
+
+### Show rules
+
+- **Full show** — only allowed when **two players are left**. It ends the round:
+  both hands are compared and the winner takes the pot.
+- **Side show** — allowed while **three or more** players remain. The initiator
+  picks an opponent, betting pauses (`SIDE_SHOW_PENDING`), and the opponent
+  accepts or declines:
+  - decline → betting resumes, nobody folds;
+  - accept → the two hands are compared privately, the weaker hand folds, both
+    players are treated as having seen their cards, and the round continues;
+  - a tie folds nobody.
+
+Only the two participants (and the administrator during a dispute) ever see the
+side-show cards, hand classes or the ranked reason. Everybody else sees a single
+announcement — *"Bela won the side show — Chetan folded."* — and the public table
+log carries no cards or hand classes either (`result` is `null` for outsiders,
+`announcement` is always present).
+
+The initiator is stored server side when the request is made — never inferred from
+message order.
+
+Evaluation order (both show types):
 
 1. Validate and lock each player's effective hand (a missing assumed card is
    auto-completed with the strongest legal suggestion and logged).
@@ -337,9 +384,10 @@ or documented here.
 6. **A player with fewer chips than the boot cannot enter the round.** Ready
    status + chips ≥ boot is the participation rule; everyone must re-ready each
    round.
-7. **"Blind" means the player has not declared `SEE_CARDS`.** The player's own
-   cards are always delivered to their own client (they need them to choose an
-   assumed card); blind only halves the stake. See limitation 3.
+7. **"Blind" means the player has not declared `SEE_CARDS`.** Your own cards are
+   withheld by the server until you press See cards, so blind play is real. The
+   blind price only exists for the first bet of a round; every later blind bet is
+   a counter (see the betting model above).
 8. **Counter** = raise that multiplies the current seen stake by
    `counterMultiplier` (3 by default) and is only legal after at least one bet.
 9. **Show is two-player** for the MVP. With more than two active players the
@@ -367,17 +415,16 @@ or documented here.
   overrides to change it — the editor validates and rejects contradictions.
 - Whether a round-boot room should charge the boot per turn instead of per round
   (both supported).
-- Whether a show should require the opponent's consent (currently immediate, as
-  the brief describes a request followed by a showdown).
+- A **full show** is immediate once only two players remain; a **side show** needs
+  the invited player to accept (declining resumes betting).
 
 ### Known limitations
 
 1. Guest identity only (no passwords); tokens live in `localStorage`.
 2. Shows compare exactly two players; a multi-player "open show" exists only via
    the bet cap.
-3. Blind players technically receive their own cards (needed for assumed-card
-   selection). A stricter "hide your own cards until you press See cards" toggle
-   would be a small follow-up.
+3. In the assumed-card modes you must press **See cards** before choosing the
+   assumed card, so those modes cannot be played fully blind.
 4. No payments/deposits/withdrawals by design.
 
 ---

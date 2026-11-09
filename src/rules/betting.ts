@@ -1,14 +1,20 @@
 /**
- * Betting engine: chaal / blind / raise / counter.
+ * Betting engine.
  *
- * House rules implemented here (see README "Assumptions"):
- *  - A blind player's stake is half of the seen ("open") stake, so the next
- *    seen player automatically puts double what the blind player put.
- *  - A blind player who does not open may either match the same blind amount or
- *    raise.
- *  - A counter is only legal after at least one bet has been made in the round.
- *    The next player then has to put `counterMultiplier` (default 3) times the
- *    previous seen stake.
+ * One number carries the table: `level`, the amount of the current bet.
+ *
+ *   - A **blind** player always matches the level (a "pass").
+ *     If the previous bet was made by a *seen* player, that match is a
+ *     **counter**: the level is then multiplied by `counterMultiplier`
+ *     (three times) and everybody after plays at the new level.
+ *   - A **seen** player pays **double** the level — but only while the betting
+ *     has been blind. Once a seen bet (or a counter) has been made, seen players
+ *     simply match the level, so a counter is exactly ×3 and never ×6.
+ *   - A **raise** sets the level to any amount above the requirement.
+ *
+ * Worked example (boot 10): blind 10 → blind 10 → blind 10 → seen 20 →
+ * blind counter 20 (level 60) → seen 60 → seen 60 → blind counter 60
+ * (level 180) …
  */
 
 export interface BetPlayer {
@@ -23,20 +29,26 @@ export interface BetPlayer {
 }
 
 export interface BettingConfig {
-  /** Blind player pays half of the seen stake (next seen player pays double). */
-  blindPlaysHalf: boolean;
-  /** Multiplier applied to the seen stake by a counter action. */
+  /** Starting level (normally the boot). */
+  level: number;
+  /** A seen player pays level × this while the betting is still blind. */
+  seenMultiple: number;
+  /** A counter multiplies the level by this. */
   counterMultiplier: number;
 }
 
 export interface BettingState {
-  stake: number;
+  /** Amount of the current bet (what a blind player must put). */
+  level: number;
+  /** True when the previous bet was made by a player who had seen their cards. */
+  lastWasSeen: boolean;
+  seenMultiple: number;
+  counterMultiplier: number;
   pot: number;
   turnSeat: number;
   counterCount: number;
   betsMade: number;
   players: BetPlayer[];
-  config: BettingConfig;
   roundOver: boolean;
   lastAction: string | null;
 }
@@ -52,16 +64,20 @@ export interface BetEvent {
   userId: string;
   type: BetActionType;
   amount: number;
-  stakeAfter: number;
+  levelAfter: number;
   potAfter: number;
   note: string;
 }
 
+export type ChaalKind = 'BLIND' | 'BLIND_COUNTER' | 'SEEN';
+
 export interface LegalActions {
   canSeeCards: boolean;
-  chaal: { amount: number; allowed: boolean };
+  chaal: { amount: number; allowed: boolean; kind: ChaalKind };
+  /** What a seen player pays right now. */
+  seenAmount: number;
   raise: { min: number; max: number; allowed: boolean };
-  counter: { amount: number; newStake: number; allowed: boolean };
+  counter: { amount: number; newLevel: number; allowed: boolean };
   fold: { allowed: boolean };
 }
 
@@ -70,14 +86,6 @@ export class BettingError extends Error {
     super(message);
     this.name = 'BettingError';
   }
-}
-
-export function blindAmount(stake: number, config: BettingConfig): number {
-  return config.blindPlaysHalf ? Math.ceil(stake / 2) : stake;
-}
-
-export function requiredAmount(state: BettingState, player: BetPlayer): number {
-  return player.blind ? blindAmount(state.stake, state.config) : state.stake;
 }
 
 export function activePlayers(state: BettingState): BetPlayer[] {
@@ -92,6 +100,26 @@ export function playerById(state: BettingState, userId: string): BetPlayer | und
   return state.players.find((p) => p.userId === userId);
 }
 
+export function chaalKind(state: BettingState, player: BetPlayer): ChaalKind {
+  if (!player.blind) return 'SEEN';
+  return state.lastWasSeen ? 'BLIND_COUNTER' : 'BLIND';
+}
+
+/** What this player must put to stay in the hand. */
+export function requiredAmount(state: BettingState, player: BetPlayer): number {
+  if (player.blind) return state.level;
+  return state.lastWasSeen ? state.level : state.level * state.seenMultiple;
+}
+
+/** Cost of an explicit counter — the same amount the player would normally put. */
+export function counterCost(state: BettingState, player: BetPlayer): number {
+  return requiredAmount(state, player);
+}
+
+export function counterLevel(state: BettingState, amount: number): number {
+  return amount * state.counterMultiplier;
+}
+
 function cloneState(state: BettingState): BettingState {
   return { ...state, players: state.players.map((p) => ({ ...p })) };
 }
@@ -102,28 +130,26 @@ export function legalActions(state: BettingState, userId: string): LegalActions 
   if (state.roundOver) return null;
   if (player.seat !== state.turnSeat) return null;
   const need = requiredAmount(state, player);
-  const counterAmount = need;
   return {
     canSeeCards: player.blind,
-    chaal: { amount: need, allowed: player.chips >= need },
+    chaal: { amount: need, allowed: player.chips >= need, kind: chaalKind(state, player) },
+    seenAmount: state.lastWasSeen ? state.level : state.level * state.seenMultiple,
     raise: {
       min: need + 1,
       max: player.chips,
       allowed: player.chips > need,
     },
     counter: {
-      amount: counterAmount,
-      newStake: state.stake * state.config.counterMultiplier,
-      allowed: state.betsMade >= 1 && player.chips >= counterAmount,
+      amount: need,
+      newLevel: counterLevel(state, need),
+      allowed: state.betsMade >= 1 && player.chips >= need,
     },
     fold: { allowed: true },
   };
 }
 
 function nextTurnSeat(state: BettingState, fromSeat: number): number {
-  const candidates = state.players
-    .filter((p) => p.inRound && !p.folded)
-    .sort((a, b) => a.seat - b.seat);
+  const candidates = state.players.filter((p) => p.inRound && !p.folded).sort((a, b) => a.seat - b.seat);
   if (candidates.length === 0) return fromSeat;
   if (candidates.length === 1) return candidates[0].seat;
   const after = candidates.find((p) => p.seat > fromSeat);
@@ -150,9 +176,8 @@ function finishTurn(state: BettingState, player: BetPlayer): void {
 }
 
 /**
- * Applies a bet. Throws BettingError for anything illegal; the caller must
- * validate ownership of the turn first (server side) which this function also
- * enforces.
+ * Applies a bet. Throws BettingError for anything illegal; the caller must also
+ * have validated that the action comes from the player on turn.
  */
 export function applyBet(state: BettingState, userId: string, action: BetAction): { state: BettingState; event: BetEvent } {
   const next = cloneState(state);
@@ -164,6 +189,7 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
   if (player.seat !== next.turnSeat) throw new BettingError('It is not your turn.', 'NOT_YOUR_TURN');
 
   const need = requiredAmount(next, player);
+  const kind = chaalKind(next, player);
 
   switch (action.type) {
     case 'SEE_CARDS': {
@@ -172,18 +198,35 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       next.lastAction = 'see';
       return {
         state: next,
-        event: { userId, type: 'SEE_CARDS', amount: 0, stakeAfter: next.stake, potAfter: next.pot, note: 'Looked at cards' },
+        event: { userId, type: 'SEE_CARDS', amount: 0, levelAfter: next.level, potAfter: next.pot, note: 'Looked at cards' },
       };
     }
     case 'CHAAL': {
       pay(next, player, need);
       next.betsMade++;
-      next.lastAction = 'chaal';
-      const note = player.blind ? `Blind chaal ${need}` : `Chaal ${need}`;
+      let note: string;
+      if (kind === 'SEEN') {
+        next.level = need; // double of the blind level, or a plain match
+        next.lastWasSeen = true;
+        next.lastAction = 'chaal';
+        note = `Chaal ${need}`;
+      } else if (kind === 'BLIND_COUNTER') {
+        // blind bet right after a seen bet: counter, level × 3 exactly once
+        next.counterCount++;
+        next.level = counterLevel(next, need);
+        next.lastWasSeen = true;
+        next.lastAction = 'counter';
+        note = `Blind counter ${need} (bet raised to ${next.level})`;
+      } else {
+        // blind pass: match the level
+        next.lastWasSeen = false;
+        next.lastAction = 'blind';
+        note = `Blind ${need}`;
+      }
       finishTurn(next, player);
       return {
         state: next,
-        event: { userId, type: 'CHAAL', amount: need, stakeAfter: next.stake, potAfter: next.pot, note },
+        event: { userId, type: 'CHAAL', amount: need, levelAfter: next.level, potAfter: next.pot, note },
       };
     }
     case 'RAISE': {
@@ -194,32 +237,27 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       if (amount > player.chips) {
         throw new BettingError('You do not have enough chips for that raise.', 'INSUFFICIENT_CHIPS');
       }
-      const wasBlind = player.blind;
       pay(next, player, amount);
       next.betsMade++;
-      next.stake = wasBlind && next.config.blindPlaysHalf ? amount * 2 : amount;
+      next.level = amount;
+      next.lastWasSeen = !player.blind;
       next.lastAction = 'raise';
       finishTurn(next, player);
       return {
         state: next,
-        event: {
-          userId,
-          type: 'RAISE',
-          amount,
-          stakeAfter: next.stake,
-          potAfter: next.pot,
-          note: `Raise to ${next.stake}${wasBlind ? ' (blind raise)' : ''}`,
-        },
+        event: { userId, type: 'RAISE', amount, levelAfter: next.level, potAfter: next.pot, note: `Raise to ${amount}` },
       };
     }
     case 'COUNTER': {
       if (next.betsMade < 1) {
         throw new BettingError('A counter is only possible after a player has bet.', 'COUNTER_NOT_ALLOWED');
       }
-      pay(next, player, need);
+      const cost = counterCost(next, player);
+      pay(next, player, cost);
       next.betsMade++;
       next.counterCount++;
-      next.stake = next.stake * next.config.counterMultiplier;
+      next.level = counterLevel(next, cost);
+      next.lastWasSeen = true;
       next.lastAction = 'counter';
       finishTurn(next, player);
       return {
@@ -227,10 +265,10 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
         event: {
           userId,
           type: 'COUNTER',
-          amount: need,
-          stakeAfter: next.stake,
+          amount: cost,
+          levelAfter: next.level,
           potAfter: next.pot,
-          note: `Counter - next player must put ${next.stake}`,
+          note: `Counter ${cost} (bet raised to ${next.level})`,
         },
       };
     }
@@ -240,7 +278,7 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       finishTurn(next, player);
       return {
         state: next,
-        event: { userId, type: 'FOLD', amount: 0, stakeAfter: next.stake, potAfter: next.pot, note: 'Folded' },
+        event: { userId, type: 'FOLD', amount: 0, levelAfter: next.level, potAfter: next.pot, note: 'Folded' },
       };
     }
     default:
@@ -250,20 +288,21 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
 
 export function createBettingState(
   players: BetPlayer[],
-  stake: number,
-  turnSeat: number,
   config: BettingConfig,
+  turnSeat: number,
   pot = 0,
 ): BettingState {
   const activeCount = players.filter((p) => p.inRound && !p.folded).length;
   return {
-    stake,
+    level: config.level,
+    lastWasSeen: false,
+    seenMultiple: config.seenMultiple,
+    counterMultiplier: config.counterMultiplier,
     pot,
     turnSeat,
     counterCount: 0,
     betsMade: 0,
     players: players.map((p) => ({ ...p })),
-    config: { ...config },
     roundOver: activeCount <= 1,
     lastAction: null,
   };

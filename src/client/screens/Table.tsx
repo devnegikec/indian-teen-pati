@@ -168,8 +168,9 @@ export function Table({ roomId }: { roomId: string }) {
             </div>
             {round && (
               <div className="stakes">
-                <span>Seen stake {round.stake}</span>
-                <span>Blind stake {round.blindStake}</span>
+                <span>Bet level {round.stake}</span>
+                <span>Seen plays {round.seenStake}</span>
+                <span>Last bet {round.lastBet}</span>
                 <span className="state">{ROUND_STATE_LABEL[round.state]}</span>
               </div>
             )}
@@ -182,6 +183,24 @@ export function Table({ roomId }: { roomId: string }) {
             {round?.state === 'BETTING' && round.turnSeat !== null && (
               <div className="turn-banner">
                 Waiting for {players.find((p) => p.seat === round.turnSeat)?.name ?? '—'}
+              </div>
+            )}
+            {round?.sideShow && round.state === 'SIDE_SHOW_PENDING' && (
+              <div className="notice notice--warn">
+                <strong>{round.sideShow.initiatorName}</strong> requested a side show with{' '}
+                <strong>{round.sideShow.targetName}</strong>. Betting is paused.
+                {me?.userId === round.sideShow.targetUserId ? (
+                  <div className="row">
+                    <button className="btn btn--small btn--primary" onClick={() => send('RESPOND_SIDE_SHOW', { accept: true })}>
+                      Accept and compare
+                    </button>
+                    <button className="btn btn--small" onClick={() => send('RESPOND_SIDE_SHOW', { accept: false })}>
+                      Decline
+                    </button>
+                  </div>
+                ) : (
+                  <div className="small">Waiting for the invited player to answer.</div>
+                )}
               </div>
             )}
             {round?.muflisRequest && round.state === 'MUFLIS_PENDING' && (
@@ -264,6 +283,37 @@ export function Table({ roomId }: { roomId: string }) {
             </div>
           )}
 
+          {round?.sideShow?.announcement && (
+            <div className="notice notice--ok">
+              <strong>Side show</strong> — {round.sideShow.initiatorName} vs {round.sideShow.targetName}:{' '}
+              {round.sideShow.announcement}
+            </div>
+          )}
+
+          {round?.sideShow?.result && (
+            <div className="result">
+              <div className="result__head">
+                <strong>Your side show</strong>
+                <span className="pill">
+                  {round.sideShow.initiatorName} vs {round.sideShow.targetName}
+                </span>
+              </div>
+              <p className="small">{round.sideShow.result.reason}</p>
+              <div className="result__hands">
+                {round.sideShow.result.hands.map((h) => (
+                  <div key={h.userId} className="result__hand">
+                    <span>
+                      {h.name}
+                      {h.userId === round.sideShow?.result?.loserUserId ? ' (folded)' : ''}
+                    </span>
+                    <Hand cards={h.cards} small />
+                    <span className="muted small">{h.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {round?.adminVisibleHands && isAdmin && (
             <div className="admin-hands">
               <h4>Administrator view — all cards</h4>
@@ -287,6 +337,9 @@ export function Table({ roomId }: { roomId: string }) {
                 {me.folded ? 'You folded this round.' : 'Waiting for your turn.'}
               </p>
             )}
+            {round?.state === 'SIDE_SHOW_PENDING' && (
+              <p className="muted small">A side show is being answered. Betting is paused.</p>
+            )}
             {round?.state === 'BETTING' && me?.isTurn && me.legal && (
               <div className="actions">
                 <div className="actions__row">
@@ -296,10 +349,14 @@ export function Table({ roomId }: { roomId: string }) {
                     </button>
                   )}
                   <button className="btn btn--primary" onClick={() => send('CHAAL')}>
-                    {me.blind ? `Blind chaal ${me.legal.chaal.amount}` : `Chaal ${me.legal.chaal.amount}`}
+                    {me.legal.chaal.kind === 'BLIND'
+                      ? `Blind ${me.legal.chaal.amount}`
+                      : me.legal.chaal.kind === 'BLIND_COUNTER'
+                        ? `Blind counter ${me.legal.chaal.amount}`
+                        : `Chaal ${me.legal.chaal.amount}`}
                   </button>
                   <button className="btn" onClick={() => send('COUNTER')}>
-                    Counter → {me.legal.counter.newStake}
+                    Counter → {me.legal.counter.newLevel}
                   </button>
                   <button className="btn btn--danger" onClick={() => send('FOLD')}>
                     Fold
@@ -326,15 +383,34 @@ export function Table({ roomId }: { roomId: string }) {
                     Raise
                   </button>
                 </div>
-                {activePlayers.length === 2 && (
+                {activePlayers.length === 2 ? (
                   <button className="btn btn--ghost" onClick={() => setShowPicker(true)}>
-                    Request show
+                    Request show (ends the round)
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn--ghost"
+                    disabled={!round.lastBettorUserId || round.lastBettorUserId === me.userId}
+                    title={
+                      round.lastBettorUserId === me.userId
+                        ? 'You made the last bet, so somebody else has to ask you'
+                        : 'A side show goes to the player who made the last bet'
+                    }
+                    onClick={() => send('SIDE_SHOW')}
+                  >
+                    Request side show{round.lastBettorName ? ` with ${round.lastBettorName}` : ''}
                   </button>
                 )}
                 {!round.muflis && room.rules.allowMidRoundMuflis && (
                   <button className="btn btn--ghost" onClick={() => send('REQUEST_MUFLIS')}>
                     Request Muflis
                   </button>
+                )}
+                {me.blind && (
+                  <p className="small muted">
+                    You are playing blind — press <strong>See cards</strong> to look at your hand
+                    {round.dealingMode !== 'THREE_CARD' ? ' (you also need to see them before choosing an assumed card)' : ''}.
+                  </p>
                 )}
                 {me.legalAssumedRanks && (
                   <div className="assumed">
@@ -377,7 +453,7 @@ export function Table({ roomId }: { roomId: string }) {
               </div>
             )}
 
-            {round && ['BETTING', 'SHOW_REQUESTED', 'MUFLIS_PENDING'].includes(round.state) && (
+            {round && ['BETTING', 'SHOW_REQUESTED', 'SIDE_SHOW_PENDING', 'MUFLIS_PENDING'].includes(round.state) && (
               <button className="btn btn--ghost" onClick={() => setConflictOpen(true)}>
                 Raise conflict
               </button>
@@ -522,7 +598,10 @@ export function Table({ roomId }: { roomId: string }) {
         <div className="modal" onClick={() => setShowPicker(false)}>
           <div className="modal__card" onClick={(e) => e.stopPropagation()}>
             <h3>Show your cards to…</h3>
-            <p className="muted small">The show compares exactly two active players.</p>
+            <p className="muted small">
+              With two players left, a full show ends the round: both hands are compared and the winner takes
+              the pot.
+            </p>
             {activePlayers
               .filter((p) => !p.isYou)
               .map((p) => (
@@ -622,6 +701,7 @@ function AdminPanel({ view, send }: { view: RoomView; send: (type: string, paylo
     bootMode: view.room.rules.bootMode,
     muflisApproval: view.room.rules.muflisApproval,
     counterMultiplier: view.room.rules.counterMultiplier,
+    seenMultiple: view.room.rules.seenMultiple,
     disputeWindowSeconds: view.room.rules.disputeWindowSeconds,
     maxBetsPerRound: view.room.rules.maxBetsPerRound,
   });
@@ -711,6 +791,15 @@ function AdminPanel({ view, send }: { view: RoomView; send: (type: string, paylo
             type="number"
             value={rules.counterMultiplier}
             onChange={(e) => setRules({ ...rules, counterMultiplier: Number(e.target.value) })}
+          />
+        </label>
+        <label className="field">
+          <span>Seen player pays level ×</span>
+          <input
+            className="input"
+            type="number"
+            value={rules.seenMultiple}
+            onChange={(e) => setRules({ ...rules, seenMultiple: Number(e.target.value) })}
           />
         </label>
         <label className="field">

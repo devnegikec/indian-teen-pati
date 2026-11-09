@@ -103,31 +103,56 @@ describe('round start, boot and chip integrity', () => {
 });
 
 describe('betting rules', () => {
-  it('lets a blind player pay half and the next seen player pay double', () => {
-    const ctx = setup({ blindPlaysHalf: true });
+  it('blind passes, seen doubles, and after a counter the next bet is exactly three times it', () => {
+    const ctx = setup({ seenMultiple: 2, counterMultiplier: 3 }); // boot 10
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
-    // initial stake = boot = 10, blind chaal = 5
     const v1 = view(ctx, ctx.bob);
     expect(v1.round?.stake).toBe(10);
-    expect(v1.round?.blindStake).toBe(5);
-    const bobLegal = v1.players.find((p) => p.userId === ctx.bob.userId)!.legal;
-    expect(bobLegal?.chaal.amount).toBe(5);
+    expect(v1.round?.seenStake).toBe(20);
+
+    // bet 1..2: blind passes at 10
+    expect(v1.players.find((p) => p.userId === ctx.bob.userId)!.legal?.chaal.kind).toBe('BLIND');
+    expect(v1.players.find((p) => p.userId === ctx.bob.userId)!.legal?.chaal.amount).toBe(10);
     ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {});
-    const v2 = view(ctx, ctx.cara);
-    expect(v2.round?.pot).toBe(35);
-    // Cara is still blind too
-    expect(v2.players.find((p) => p.userId === ctx.cara.userId)!.legal?.chaal.amount).toBe(5);
-    // Admin sees cards and then must pay the full seen stake
-    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'SEE_CARDS', {});
     expect(view(ctx, ctx.cara).players.find((p) => p.userId === ctx.cara.userId)!.legal?.chaal.amount).toBe(10);
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'CHAAL', {});
+
+    // bet 3: seen -> double (20)
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'SEE_CARDS', {});
+    const adminLegal = view(ctx, ctx.admin).players.find((p) => p.userId === ctx.admin.userId)!.legal;
+    expect(adminLegal?.chaal.kind).toBe('SEEN');
+    expect(adminLegal?.chaal.amount).toBe(20);
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'CHAAL', {});
+
+    // bet 4: blind after a seen bet -> pays the current bet (20) and counters
+    const bobAgain = view(ctx, ctx.bob).players.find((p) => p.userId === ctx.bob.userId)!.legal;
+    expect(bobAgain?.chaal.kind).toBe('BLIND_COUNTER');
+    expect(bobAgain?.chaal.amount).toBe(20);
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {});
+
+    // level is exactly 3 × the counter amount (60), not 6 ×
+    expect(view(ctx, ctx.admin).round?.stake).toBe(60);
+    expect(view(ctx, ctx.admin).round?.seenStake).toBe(60);
+
+    // bet 5: a SEEN player now pays 60 (previously this wrongly paid 120)
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'SEE_CARDS', {});
+    const caraSeen = view(ctx, ctx.cara).players.find((p) => p.userId === ctx.cara.userId)!.legal;
+    expect(caraSeen?.chaal.kind).toBe('SEEN');
+    expect(caraSeen?.chaal.amount).toBe(60);
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'CHAAL', {});
+    expect(view(ctx, ctx.admin).round?.stake).toBe(60);
+
+    // bet 6: another seen player just matches 60
+    const adminAgain = view(ctx, ctx.admin).players.find((p) => p.userId === ctx.admin.userId)!.legal;
+    expect(adminAgain?.chaal.amount).toBe(60);
   });
 
-  it('requires a counter to be preceded by a bet and triples the next stake', () => {
-    const ctx = setup({ counterMultiplier: 3, blindPlaysHalf: true });
+  it('requires a counter to be preceded by a bet and triples the level', () => {
+    const ctx = setup({ counterMultiplier: 3 });
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
     expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'COUNTER', {})).toThrow(/after a player has bet/i);
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {});
-    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'COUNTER', {});
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {}); // blind pass at 10
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'COUNTER', {}); // pays 10, level -> 30
     expect(view(ctx, ctx.admin).round?.stake).toBe(30);
   });
 
@@ -154,9 +179,12 @@ describe('betting rules', () => {
 });
 
 describe('assumed card modes', () => {
-  it('rejects an illegal assumed card and accepts a legal one', () => {
+  it('rejects an illegal assumed card, requires seeing first, and accepts a legal one', () => {
     const ctx = setup({ dealingMode: 'TWO_CARD_ASSUMED' }, 2);
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    // a blind player cannot choose an assumed card for a hand they have not seen
+    expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SET_ASSUMED', { rank: 2 })).toThrow(/see cards/i);
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SEE_CARDS', {});
     const me = view(ctx, ctx.bob).players.find((p) => p.userId === ctx.bob.userId)!;
     const top = Math.max(...me.cards.map((c) => c.rank));
     expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SET_ASSUMED', { rank: top + 1 })).toThrow(/assumed rank/i);
@@ -167,6 +195,7 @@ describe('assumed card modes', () => {
   it('locks the assumed card once the reveal begins', () => {
     const ctx = setup({ dealingMode: 'TWO_CARD_ASSUMED' }, 2);
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SEE_CARDS', {});
     const bob = view(ctx, ctx.bob);
     const topBob = Math.max(...bob.players.find((p) => p.userId === ctx.bob.userId)!.cards.map((c) => c.rank));
     ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SET_ASSUMED', { rank: topBob });
@@ -176,12 +205,67 @@ describe('assumed card modes', () => {
     expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SET_ASSUMED', { rank: 2 })).toThrow();
   });
 
-  it('refuses a show with more than two active players', () => {
+  it('only allows a full show when two players are left and offers a side show otherwise', () => {
     const ctx = setup({ dealingMode: 'TWO_CARD_ASSUMED' }, 3);
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
     expect(() =>
       ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SHOW', { targetUserId: ctx.cara.userId }),
-    ).toThrow(/two active players/i);
+    ).toThrow(/two players are left/i);
+    // the side show goes to the player who made the last bet
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {}); // bob (first to act) bets
+    const target = view(ctx, ctx.cara).round?.lastBettorUserId;
+    expect(target).toBe(ctx.bob.userId);
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'SIDE_SHOW', {});
+    expect(view(ctx, ctx.admin).round?.state).toBe('SIDE_SHOW_PENDING');
+    expect(view(ctx, ctx.admin).round?.sideShow?.targetUserId).toBe(ctx.bob.userId);
+    expect(() => ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'CHAAL', {})).toThrow();
+    // nothing is revealed until the request is accepted
+    const pending = view(ctx, ctx.bob);
+    expect(pending.players.find((p) => p.userId === ctx.cara.userId)!.cards.every((c) => c.hidden)).toBe(true);
+    expect(pending.round?.sideShow?.result).toBeNull();
+    // only the invited player may answer
+    expect(() => ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'RESPOND_SIDE_SHOW', { accept: true })).toThrow(
+      /invited/i,
+    );
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'RESPOND_SIDE_SHOW', { accept: true });
+    const v = view(ctx, ctx.admin);
+    expect(v.round?.state).toBe('BETTING');
+    expect(v.round?.sideShow?.status).toBe('ACCEPTED');
+    // exactly one of the two participants folded
+    const folded = v.players.filter((p) => p.folded).map((p) => p.userId);
+    expect(folded.length).toBe(1);
+    expect([ctx.bob.userId, ctx.cara.userId]).toContain(folded[0]);
+    // a side show means both players have effectively seen their cards
+    expect(v.players.find((p) => p.userId === ctx.bob.userId)!.blind).toBe(false);
+    expect(v.players.find((p) => p.userId === ctx.cara.userId)!.blind).toBe(false);
+    // the two participants can see each other's cards, the third player cannot
+    const bobView = view(ctx, ctx.bob);
+    const caraCards = bobView.players.find((p) => p.userId === ctx.cara.userId)!.cards;
+    expect(caraCards.every((c) => c.hidden)).toBe(false);
+    expect(bobView.round?.sideShow?.result).not.toBeNull();
+    expect(bobView.round?.sideShow?.result?.hands.length).toBe(2);
+
+    const adminView = view(ctx, ctx.admin);
+    expect(adminView.players.find((p) => p.userId === ctx.cara.userId)!.cards.every((c) => c.hidden)).toBe(true);
+    expect(adminView.players.find((p) => p.userId === ctx.bob.userId)!.cards.every((c) => c.hidden)).toBe(true);
+    // outsiders only get a plain announcement: no hands, no hand classes
+    expect(adminView.round?.sideShow?.result).toBeNull();
+    expect(adminView.round?.sideShow?.announcement).toMatch(/side show/i);
+    expect(adminView.round?.sideShow?.announcement).not.toMatch(/high card|trail|colour|pair|sequence/i);
+    expect(adminView.round?.log.some((l) => /high card|trail|colour|pair|sequence/i.test(l.text))).toBe(false);
+  });
+
+  it('resumes betting when a side show is declined', () => {
+    const ctx = setup();
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    // the side show is offered to the player who made the last bet
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {});
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'SIDE_SHOW', {});
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'RESPOND_SIDE_SHOW', { accept: false });
+    const v = view(ctx, ctx.admin);
+    expect(v.round?.state).toBe('BETTING');
+    expect(v.round?.sideShow?.status).toBe('DECLINED');
+    expect(v.players.some((p) => p.folded)).toBe(false);
   });
 });
 
@@ -341,15 +425,24 @@ describe('reconnection', () => {
     );
   });
 
-  it('never exposes hidden opponent cards before a reveal', () => {
+  it('keeps your own cards hidden until you press See cards', () => {
     const ctx = setup();
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
-    const v = view(ctx, ctx.bob);
-    const admin = v.players.find((p) => p.userId === ctx.admin.userId)!;
-    expect(admin.cards.every((c) => c.hidden)).toBe(true);
-    expect(admin.cards.every((c) => c.rank === 0)).toBe(true);
-    const own = v.players.find((p) => p.userId === ctx.bob.userId)!;
-    expect(own.cards.some((c) => !c.hidden && c.rank > 0)).toBe(true);
+    const before = view(ctx, ctx.bob);
+    const ownBefore = before.players.find((p) => p.userId === ctx.bob.userId)!;
+    expect(ownBefore.blind).toBe(true);
+    expect(ownBefore.cards.length).toBe(3);
+    expect(ownBefore.cards.every((c) => c.hidden)).toBe(true);
+    expect(ownBefore.handLabel).toBeNull();
+    // opponents stay hidden too
+    expect(before.players.find((p) => p.userId === ctx.admin.userId)!.cards.every((c) => c.hidden)).toBe(true);
+
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SEE_CARDS', {});
+    const after = view(ctx, ctx.bob);
+    const ownAfter = after.players.find((p) => p.userId === ctx.bob.userId)!;
+    expect(ownAfter.blind).toBe(false);
+    expect(ownAfter.cards.some((c) => !c.hidden && c.rank > 0)).toBe(true);
+    expect(ownAfter.handLabel).not.toBeNull();
   });
 });
 

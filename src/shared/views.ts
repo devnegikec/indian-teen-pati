@@ -24,7 +24,8 @@ export interface RoomRules {
   threeCardCompare: ThreeCardCompare;
   muflisApproval: MuflisApproval;
   counterMultiplier: number;
-  blindPlaysHalf: boolean;
+  /** Seen player pays level × seenMultiple (double by default). */
+  seenMultiple: number;
   disputeWindowSeconds: number;
   remainderRule: RemainderRule;
   maxPlayers: number;
@@ -46,7 +47,7 @@ export const DEFAULT_RULES: RoomRules = {
   threeCardCompare: 'FULL_HAND',
   muflisApproval: 'ADMIN',
   counterMultiplier: 3,
-  blindPlaysHalf: true,
+  seenMultiple: 2,
   disputeWindowSeconds: 15,
   remainderRule: 'LOWEST_SEAT',
   maxPlayers: MAX_SEATS,
@@ -99,6 +100,30 @@ export interface ShowInfo {
   at: string;
 }
 
+export interface SideShowView {
+  initiatorUserId: string;
+  initiatorName: string;
+  targetUserId: string;
+  targetName: string;
+  at: string;
+  status: 'PENDING' | 'ACCEPTED' | 'DECLINED';
+  /**
+   * Public one-liner shown to the whole table. Deliberately carries no cards or
+   * hand classes: "Ravi won the side show — Bot Ana folded."
+   */
+  announcement: string | null;
+  /**
+   * Full comparison (hands + reason). Only ever populated for the two players
+   * involved in the side show (and the administrator during a dispute).
+   */
+  result: {
+    loserUserId: string | null;
+    loserName: string | null;
+    reason: string;
+    hands: HandResultView[];
+  } | null;
+}
+
 export interface MuflisRequestView {
   by: string;
   byName: string;
@@ -147,8 +172,15 @@ export interface RoundView {
   seq: number;
   state: RoundState;
   pot: number;
+  /** Amount of the current bet (what a blind player must put). */
   stake: number;
-  blindStake: number;
+  /** What a seen player pays right now. */
+  seenStake: number;
+  /** Amount of the current bet (alias of `stake`, kept for the UI). */
+  lastBet: number;
+  /** The player who made the last bet — a side show is offered to them. */
+  lastBettorUserId: string | null;
+  lastBettorName: string | null;
   turnSeat: number | null;
   muflis: boolean;
   dealingMode: DealingMode;
@@ -157,6 +189,7 @@ export interface RoundView {
   bootMode: BootMode;
   sharedCard: CardView | null;
   show: ShowInfo | null;
+  sideShow: SideShowView | null;
   muflisRequest: MuflisRequestView | null;
   revealed: boolean;
   result: RoundResultView | null;

@@ -5,7 +5,6 @@ import {
   BettingConfig,
   BettingState,
   applyBet,
-  blindAmount,
   createBettingState,
   legalActions as computeLegalActions,
 } from '../rules/betting';
@@ -38,6 +37,7 @@ import {
   RoundSummary,
   RoundView,
   ShowInfo,
+  SideShowView,
 } from '../shared/views';
 
 export class AppError extends Error {
@@ -125,7 +125,12 @@ export interface RoundDoc {
   sharedCardId: string | null;
   players: RoundPlayerDoc[];
   pot: number;
+  /** Amount of the current bet (what a blind player must put). */
   stake: number;
+  /** True when the previous bet was made by a player who had seen their cards. */
+  lastWasSeen: boolean;
+  /** Who made the last bet — the side-show request goes to this player. */
+  lastBettorUserId: string | null;
   turnSeat: number;
   betsMade: number;
   counterCount: number;
@@ -138,6 +143,16 @@ export interface RoundDoc {
     status: 'PENDING' | 'APPROVED' | 'REJECTED';
   } | null;
   show: { initiator: string; target: string; at: string } | null;
+  sideShow: {
+    initiator: string;
+    target: string;
+    at: string;
+    status: 'PENDING' | 'ACCEPTED' | 'DECLINED';
+    loser?: string | null;
+    reason?: string;
+    announcement?: string;
+    hands?: HandResultView[];
+  } | null;
   result: RoundResultView | null;
   provisionalUntil: number | null;
   dispute: DisputeDoc | null;
@@ -149,7 +164,16 @@ export interface RoundDoc {
 }
 
 const REVEAL_STATES: RoundState[] = ['PROVISIONAL', 'DISPUTE', 'SETTLED'];
-const ACTIVE_ROUND_STATES: RoundState[] = ['BOOT', 'DEALING', 'BETTING', 'SHOW_REQUESTED', 'MUFLIS_PENDING', 'PROVISIONAL', 'DISPUTE'];
+const ACTIVE_ROUND_STATES: RoundState[] = [
+  'BOOT',
+  'DEALING',
+  'BETTING',
+  'SHOW_REQUESTED',
+  'SIDE_SHOW_PENDING',
+  'MUFLIS_PENDING',
+  'PROVISIONAL',
+  'DISPUTE',
+];
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -407,8 +431,9 @@ export class GameService {
 
   private toBetting(doc: RoundDoc): BettingState {
     const config: BettingConfig = {
-      blindPlaysHalf: doc.rules.blindPlaysHalf,
-      counterMultiplier: doc.rules.counterMultiplier,
+      level: doc.stake,
+      seenMultiple: doc.rules.seenMultiple ?? 2,
+      counterMultiplier: doc.rules.counterMultiplier ?? 3,
     };
     const players: BetPlayer[] = doc.players.map((p) => ({
       userId: p.userId,
@@ -420,13 +445,16 @@ export class GameService {
       totalBet: p.totalBet,
       hasActed: p.hasActed,
     }));
-    const state = createBettingState(players, doc.stake, doc.turnSeat, config, doc.pot);
+    const state = createBettingState(players, config, doc.turnSeat, doc.pot);
+    state.level = doc.stake;
+    state.lastWasSeen = doc.lastWasSeen ?? false;
     state.betsMade = doc.betsMade;
     state.counterCount = doc.counterCount;
     return state;
   }
   private fromBetting(doc: RoundDoc, state: BettingState): void {
-    doc.stake = state.stake;
+    doc.stake = state.level;
+    doc.lastWasSeen = state.lastWasSeen;
     doc.pot = state.pot;
     doc.turnSeat = state.turnSeat;
     doc.betsMade = state.betsMade;
@@ -531,6 +559,8 @@ export class GameService {
       case 'FOLD':
       case 'SET_ASSUMED':
       case 'SHOW':
+      case 'SIDE_SHOW':
+      case 'RESPOND_SIDE_SHOW':
         this.roundAction(room, userId, type, payload);
         return;
       case 'REQUEST_MUFLIS':
@@ -608,12 +638,15 @@ export class GameService {
       }),
       pot: 0,
       stake: rules.boot,
+      lastWasSeen: false,
+      lastBettorUserId: null,
       turnSeat: firstToAct,
       betsMade: 0,
       counterCount: 0,
       muflis: false,
       muflisRequest: null,
       show: null,
+      sideShow: null,
       result: null,
       provisionalUntil: null,
       dispute: null,
@@ -648,7 +681,7 @@ export class GameService {
     doc.stake = rules.boot;
     this.log(
       doc,
-      `${rules.dealingMode === 'THREE_CARD' ? 'Three cards' : rules.dealingMode === 'TWO_CARD_ASSUMED' ? 'Two cards + assumed card' : 'One card + shared card'} dealt. ${doc.players.find((p) => p.seat === doc.turnSeat)?.name} to act.`,
+      `${rules.dealingMode === 'THREE_CARD' ? 'Three cards' : rules.dealingMode === 'TWO_CARD_ASSUMED' ? 'Two cards + assumed card' : 'One card + shared card'} dealt. Blind ${rules.boot}, seen chaal ${rules.boot * rules.seenMultiple}. ${doc.players.find((p) => p.seat === doc.turnSeat)?.name} to act.`,
     );
     this.db.prepare('UPDATE rooms SET last_dealer_seat = ? WHERE id = ?').run(dealerSeat, room.id);
     this.saveDoc(doc);
@@ -701,7 +734,11 @@ export class GameService {
   }
 
   private roundAction(room: RoomRow, userId: string, type: string, payload: Record<string, unknown>): void {
-    const doc = this.currentDoc(room.id, ['BETTING', 'SHOW_REQUESTED']);
+    if (type === 'RESPOND_SIDE_SHOW') {
+      this.respondSideShow(room, userId, payload.accept === true);
+      return;
+    }
+    const doc = this.currentDoc(room.id, ['BETTING', 'SHOW_REQUESTED', 'SIDE_SHOW_PENDING']);
     this.member(room.id, userId);
     const player = doc.players.find((p) => p.userId === userId);
     if (!player) throw new AppError('You are not part of this round.', 'NOT_IN_ROUND');
@@ -713,6 +750,9 @@ export class GameService {
         }
         if (REVEAL_STATES.includes(doc.state)) {
           throw new AppError('Assumed cards are locked once the reveal begins.', 'ASSUMED_LOCKED');
+        }
+        if (player.blind) {
+          throw new AppError('Press "See cards" before choosing an assumed card.', 'SEE_CARDS_FIRST');
         }
         const rank = Number(payload.rank);
         const physical = player.cards.map(cardFromId);
@@ -729,7 +769,12 @@ export class GameService {
         this.saveDoc(doc);
         return;
       }
+      case 'SIDE_SHOW': {
+        this.requestSideShow(doc, userId);
+        return;
+      }
       case 'SHOW': {
+        if (doc.state !== 'BETTING') throw new AppError('That action is not allowed right now.', 'BAD_STATE');
         const targetId = String(payload.targetUserId ?? '');
         const target = doc.players.find((p) => p.userId === targetId);
         if (!target) throw new AppError('Choose an opponent to show against.', 'BAD_TARGET');
@@ -738,7 +783,10 @@ export class GameService {
         if (player.folded || !player.inRound) throw new AppError('You have folded.', 'FOLDED');
         const activeCount = doc.players.filter((p) => p.inRound && !p.folded).length;
         if (activeCount > 2) {
-          throw new AppError('A show is only possible when it is down to two active players in this MVP.', 'SHOW_NOT_ALLOWED');
+          throw new AppError(
+            'A full show is only allowed when two players are left. Use a side show request while three or more remain.',
+            'SHOW_NOT_ALLOWED',
+          );
         }
         doc.show = { initiator: userId, target: targetId, at: nowIso() };
         doc.state = 'SHOW_REQUESTED';
@@ -766,6 +814,7 @@ export class GameService {
         };
         const { state: after, event } = applyBet(state, userId, betAction);
         this.fromBetting(doc, after);
+        if (betAction.type !== 'FOLD') doc.lastBettorUserId = userId;
         this.log(doc, `${player.name}: ${event.note}. Pot ${doc.pot}.`);
         if (after.roundOver) {
           const active = doc.players.filter((p) => p.inRound && !p.folded);
@@ -782,6 +831,111 @@ export class GameService {
   /* ---------------------------------------------------------------- */
   /* Muflis requests                                                  */
   /* ---------------------------------------------------------------- */
+
+  /* ---------------------------------------------------------------- */
+  /* Side show (3+ players)                                           */
+  /* ---------------------------------------------------------------- */
+
+  private requestSideShow(doc: RoundDoc, userId: string): void {
+    if (doc.state !== 'BETTING') throw new AppError('A side show can only be requested while betting.', 'BAD_STATE');
+    const active = doc.players.filter((p) => p.inRound && !p.folded);
+    if (active.length < 3) {
+      throw new AppError('Only two players are left, so use "Request show" to end the round.', 'SHOW_INSTEAD');
+    }
+    const player = active.find((p) => p.userId === userId);
+    if (!player) throw new AppError('Only active players can request a side show.', 'NOT_ACTIVE');
+
+    // A side show always goes to the player who made the last bet.
+    const targetId = doc.lastBettorUserId;
+    if (!targetId) throw new AppError('Nobody has bet yet, so there is nobody to show against.', 'NO_LAST_BETTOR');
+    const target = active.find((p) => p.userId === targetId);
+    if (!target) throw new AppError('The player who made the last bet has folded.', 'NO_LAST_BETTOR');
+    if (target.userId === userId) {
+      throw new AppError('You made the last bet, so somebody else has to ask you.', 'BAD_TARGET');
+    }
+    if (doc.sideShow && doc.sideShow.status === 'PENDING') {
+      throw new AppError('A side show request is already pending.', 'SIDE_SHOW_PENDING');
+    }
+    doc.sideShow = { initiator: userId, target: targetId, at: nowIso(), status: 'PENDING' };
+    doc.state = 'SIDE_SHOW_PENDING';
+    this.log(doc, `${player.name} requested a side show with ${target.name}. Betting is paused until they answer.`);
+    this.saveDoc(doc);
+  }
+
+  private respondSideShow(room: RoomRow, userId: string, accept: boolean): void {
+    const doc = this.currentDoc(room.id, ['SIDE_SHOW_PENDING']);
+    const request = doc.sideShow;
+    if (!request || request.status !== 'PENDING') throw new AppError('There is no pending side show.', 'NO_SIDE_SHOW');
+    if (userId !== request.target) throw new AppError('Only the invited player can answer a side show.', 'NOT_TARGET');
+    const a = doc.players.find((p) => p.userId === request.initiator)!;
+    const b = doc.players.find((p) => p.userId === request.target)!;
+
+    if (a.folded || b.folded || !a.inRound || !b.inRound) {
+      request.status = 'DECLINED';
+      doc.state = 'BETTING';
+      this.log(doc, 'The side show was cancelled because a player had already folded.');
+      this.saveDoc(doc);
+      return;
+    }
+
+    if (!accept) {
+      request.status = 'DECLINED';
+      doc.state = 'BETTING';
+      this.log(doc, `${b.name} declined the side show. Betting resumes.`);
+      this.saveDoc(doc);
+      return;
+    }
+
+    const ranking = this.resolvedFor(doc.rankingProfile);
+    const handA = this.buildHand(doc, a, ranking);
+    const handB = this.buildHand(doc, b, ranking);
+    const showdown = decideShowdown(handA, handB, {
+      ranking,
+      muflis: doc.muflis,
+      mode: doc.rules.dealingMode,
+      threeCardCompare: doc.rules.threeCardCompare,
+      initiator: 'a',
+      sharedCardId: doc.sharedCardId ?? undefined,
+    });
+    const loserId = showdown.winner === 'a' ? b.userId : showdown.winner === 'b' ? a.userId : null;
+    const winnerName = showdown.winner === 'a' ? a.name : showdown.winner === 'b' ? b.name : null;
+    const loserName = loserId ? doc.players.find((p) => p.userId === loserId)!.name : null;
+    request.status = 'ACCEPTED';
+    request.loser = loserId;
+    // Full detail is stored for the two participants; the table only gets the
+    // announcement below (no cards, no hand classes).
+    request.reason = showdown.reason;
+    request.announcement = loserName
+      ? `${winnerName} won the side show — ${loserName} folded.`
+      : 'The side show was tied — nobody folds.';
+    // Once your cards have been compared you have effectively seen them.
+    a.blind = false;
+    b.blind = false;
+    request.hands = [
+      { userId: a.userId, name: a.name, cards: this.cardViews(a), assumedRank: a.assumedRank, label: handA.label, folded: false },
+      { userId: b.userId, name: b.name, cards: this.cardViews(b), assumedRank: b.assumedRank, label: handB.label, folded: false },
+    ];
+
+    if (loserId) {
+      const loser = doc.players.find((p) => p.userId === loserId)!;
+      loser.folded = true;
+      loser.hasActed = true;
+    }
+    // Public log line: who was involved and who folded, never the hands.
+    this.log(doc, `Side show: ${a.name} vs ${b.name}. ${request.announcement}`);
+
+    const remaining = doc.players.filter((p) => p.inRound && !p.folded);
+    if (remaining.length <= 1) {
+      this.resolveLastPlayer(doc, remaining[0]);
+      return;
+    }
+    doc.state = 'BETTING';
+    const onTurn = doc.players.find((p) => p.seat === doc.turnSeat);
+    if (!onTurn || onTurn.folded) {
+      doc.turnSeat = nextSeatAfter(doc.turnSeat, remaining.map((p) => p.seat));
+    }
+    this.saveDoc(doc);
+  }
 
   private requestMuflis(room: RoomRow, userId: string): void {
     const doc = this.currentDoc(room.id, ['BETTING']);
@@ -1252,12 +1406,20 @@ export class GameService {
     const revealed = !!doc && REVEAL_STATES.includes(doc.state);
     const viewerIsAdmin = room.admin_id === viewerId;
     const adminSeesAll = viewerIsAdmin && !!doc && doc.state === 'DISPUTE';
+    // A side show reveals cards only once the invited player has accepted.
+    const sideShowPair =
+      doc?.sideShow &&
+      doc.sideShow.status === 'ACCEPTED' &&
+      (doc.sideShow.initiator === viewerId || doc.sideShow.target === viewerId)
+        ? new Set([doc.sideShow.initiator, doc.sideShow.target])
+        : null;
 
     const players: PlayerView[] = members.map((m) => {
       const rp = doc?.players.find((p) => p.userId === m.user_id);
       const user = this.db.prepare('SELECT name FROM users WHERE id = ?').get(m.user_id) as UserRow | undefined;
       const isYou = m.user_id === viewerId;
-      const showCards = !!rp && (isYou || revealed || adminSeesAll);
+      const showCards =
+        !!rp && ((isYou && !rp.blind) || revealed || adminSeesAll || (sideShowPair?.has(m.user_id) ?? false));
       let cards: CardView[] = [];
       if (rp) {
         const raw = rp.cards.map(cardFromId);
@@ -1268,13 +1430,13 @@ export class GameService {
           cards = raw.map(() => ({ rank: 0, suit: null, hidden: true }));
         }
       }
-      const rpAmounts = doc?.result?.amounts ?? {};
       const legal =
         !!doc && isYou && doc.state === 'BETTING' && doc.turnSeat === m.seat
           ? computeLegalActions(this.toBetting(doc), viewerId)
           : null;
+      // You must look at your cards before you can choose an assumed card.
       const canAssume =
-        !!rp && !!doc && doc.rules.dealingMode !== 'THREE_CARD' && !revealed && isYou;
+        !!rp && !!doc && doc.rules.dealingMode !== 'THREE_CARD' && !revealed && isYou && !rp.blind;
       const shared = doc?.sharedCardId ? cardFromId(doc.sharedCardId) : null;
 
       const handLabel = rp && ranking && showCards && !rp.blind ? this.peekLabel(doc!, rp, ranking) : null;
@@ -1320,8 +1482,29 @@ export class GameService {
             at: doc.show.at,
           }
         : null;
-      const muflisRequest: MuflisRequestView | null = doc.muflisRequest
+      const sideShow: SideShowView | null = doc.sideShow
         ? {
+            initiatorUserId: doc.sideShow.initiator,
+            initiatorName: doc.players.find((p) => p.userId === doc.sideShow!.initiator)?.name ?? '',
+            targetUserId: doc.sideShow.target,
+            targetName: doc.players.find((p) => p.userId === doc.sideShow!.target)?.name ?? '',
+            at: doc.sideShow.at,
+            status: doc.sideShow.status,
+            announcement: doc.sideShow.announcement ?? null,
+            // Only the two players involved (and the admin during a dispute) get
+            // the hands and the ranked reason.
+            result:
+              doc.sideShow.hands && (adminSeesAll || sideShowPair)
+                ? {
+                    loserUserId: doc.sideShow.loser ?? null,
+                    loserName: doc.players.find((p) => p.userId === doc.sideShow!.loser)?.name ?? null,
+                    reason: doc.sideShow.reason ?? '',
+                    hands: doc.sideShow.hands,
+                  }
+                : null,
+          }
+        : null;
+      const muflisRequest: MuflisRequestView | null = doc.muflisRequest        ? {
             by: doc.muflisRequest.by,
             byName: doc.players.find((p) => p.userId === doc.muflisRequest!.by)?.name ?? '',
             at: doc.muflisRequest.at,
@@ -1347,10 +1530,10 @@ export class GameService {
         state: doc.state,
         pot: doc.pot,
         stake: doc.stake,
-        blindStake: blindAmount(doc.stake, {
-          blindPlaysHalf: doc.rules.blindPlaysHalf,
-          counterMultiplier: doc.rules.counterMultiplier,
-        }),
+        seenStake: doc.lastWasSeen ? doc.stake : doc.stake * (doc.rules.seenMultiple ?? 2),
+        lastBet: doc.stake,
+        lastBettorUserId: doc.lastBettorUserId ?? null,
+        lastBettorName: doc.lastBettorUserId ? (doc.players.find((p) => p.userId === doc.lastBettorUserId)?.name ?? null) : null,
         turnSeat: doc.state === 'BETTING' ? doc.turnSeat : null,
         muflis: doc.muflis,
         dealingMode: doc.rules.dealingMode,
@@ -1359,6 +1542,7 @@ export class GameService {
         bootMode: doc.rules.bootMode,
         sharedCard: sharedCard ? { rank: sharedCard.rank, suit: sharedCard.suit } : null,
         show,
+        sideShow,
         muflisRequest,
         revealed,
         result: doc.result,
@@ -1426,6 +1610,7 @@ function sanitiseRules(input: RoomRules): RoomRules {
   rules.minBoot = Math.max(1, Math.floor(Number(rules.minBoot) || 1));
   rules.boot = Math.max(rules.minBoot, Math.floor(Number(rules.boot) || rules.minBoot));
   rules.counterMultiplier = Math.max(2, Math.floor(Number(rules.counterMultiplier) || 3));
+  rules.seenMultiple = Math.max(1, Math.floor(Number(rules.seenMultiple) || 2));
   rules.disputeWindowSeconds = Math.max(0, Math.min(600, Math.floor(Number(rules.disputeWindowSeconds) || 0)));
   rules.maxPlayers = Math.max(2, Math.min(MAX_SEATS, Math.floor(Number(rules.maxPlayers) || 2)));
   rules.startingChips = Math.max(rules.boot, Math.floor(Number(rules.startingChips) || 1000));

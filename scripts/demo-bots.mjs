@@ -15,11 +15,6 @@ const BASE = process.env.BASE_URL ?? 'http://localhost:3000';
 const [humanToken, botArg] = process.argv.slice(2);
 const botCount = Number(botArg ?? 2);
 
-if (!humanToken) {
-  console.error('Usage: node scripts/demo-bots.mjs <humanToken> [botCount]');
-  process.exit(1);
-}
-
 async function api(path, { token, method = 'GET', body } = {}) {
   const response = await fetch(`${BASE}${path}`, {
     method,
@@ -71,7 +66,7 @@ const created = await api('/api/rooms', {
 });
 const roomId = created.roomId;
 
-await api(`/api/rooms/${created.code}/join`, { token: humanToken, method: 'POST' });
+await api(`/api/rooms/${created.code}/join`, { token: humanToken, method: 'POST' }).catch(() => undefined);
 for (const bot of bots.slice(1)) {
   await api(`/api/rooms/${created.code}/join`, { token: bot.token, method: 'POST' });
 }
@@ -84,9 +79,9 @@ for (const bot of bots) {
   sockets.set(bot.userId, socket);
 }
 
-const humanSocket = await connect(humanToken);
-humanSocket.on('connect', () => humanSocket.emit('room:join', { roomId }));
-humanSocket.emit('room:join', { roomId });
+const humanSocket = humanToken ? await connect(humanToken) : null;
+humanSocket?.on('connect', () => humanSocket.emit('room:join', { roomId }));
+humanSocket?.emit('room:join', { roomId });
 
 const hostSocket = sockets.get(host.userId);
 let lastRoundId = null;
@@ -96,10 +91,10 @@ const blindCounts = new Map();
 
 function readyAndStart() {
   for (const bot of bots) act(sockets.get(bot.userId), roomId, 'READY', { ready: true });
-  // only start once everyone in the room is ready, so a human can join in
+  // only start once at least two players are ready, so a human can join in
   setTimeout(() => {
-    const everyoneReady = !latestView || latestView.players.every((p) => p.ready);
-    if (everyoneReady) act(hostSocket, roomId, 'START_ROUND');
+    const readyCount = latestView ? latestView.players.filter((p) => p.ready).length : 0;
+    if (readyCount >= 2) act(hostSocket, roomId, 'START_ROUND');
   }, 800);
 }
 
@@ -122,6 +117,10 @@ for (const bot of bots) {
       console.log(`Round ${round.seq} dealt. Pot ${round.pot}.`);
     }
     const me = view.players.find((p) => p.userId === bot.userId);
+    if (round.sideShow && round.sideShow.status === 'PENDING' && round.sideShow.targetUserId === bot.userId) {
+      setTimeout(() => act(socket, roomId, 'RESPOND_SIDE_SHOW', { accept: Math.random() < 0.75 }), 900);
+      return;
+    }
     if (round.state === 'BETTING' && me?.isTurn && me.legal) {
       setTimeout(() => {
         if (!me.legal) return;
@@ -146,7 +145,7 @@ for (const bot of bots) {
   socket.on('room:error', (error) => console.log(`[${bot.name}] ${error.message}`));
 }
 
-humanSocket.on('room:error', (error) => console.log(`[you] ${error.message}`));
+humanSocket?.on('room:error', (error) => console.log(`[you] ${error.message}`));
 
 console.log(`Demo room created: ${created.code} (id ${roomId})`);
 console.log(`Join at http://localhost:5173/#/join/${created.code} then press "I am ready".`);
