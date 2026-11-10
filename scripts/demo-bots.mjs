@@ -59,6 +59,7 @@ const created = await api('/api/rooms', {
       minBoot: 10,
       startingChips: 5000,
       disputeWindowSeconds: 8,
+      gameType: process.env.GAME ?? 'NORMAL',
       dealingMode: process.env.MODE ?? 'THREE_CARD',
       maxBetsPerRound: Number(process.env.BET_CAP ?? 24),
     },
@@ -117,6 +118,11 @@ for (const bot of bots) {
       console.log(`Round ${round.seq} dealt. Pot ${round.pot}.`);
     }
     const me = view.players.find((p) => p.userId === bot.userId);
+    if (round.state === 'WINNER_CHOICE' && round.survivorUserId === bot.userId) {
+      // the last player standing decides whether to reveal (a show advances Muflis)
+      setTimeout(() => act(socket, roomId, 'WINNER_ACTION', { show: Math.random() < 0.7 }), 800);
+      return;
+    }
     if (round.sideShow && round.sideShow.status === 'PENDING' && round.sideShow.targetUserId === bot.userId) {
       setTimeout(() => act(socket, roomId, 'RESPOND_SIDE_SHOW', { accept: Math.random() < 0.75 }), 900);
       return;
@@ -132,9 +138,16 @@ for (const bot of bots) {
           return;
         }
         if (blind) blindCounts.set(bot.userId, (blindCounts.get(bot.userId) ?? 0) + 1);
-        // occasionally ask the player before us for a side show (this also
-        // places the bot's bet, so it replaces the chaal)
-        if (!blind && round.sideShowAllowed && Math.random() < 0.12) {
+        // assumed-card modes: pick the suggested rank once the cards are seen
+        if (!blind && me.legalAssumedRanks && me.assumedRank === null) {
+          act(socket, roomId, 'SET_ASSUMED', { rank: Math.max(...me.legalAssumedRanks) });
+          return;
+        }
+        // heads-up: sometimes ask for a full show (this also places the bet)
+        const others = view.players.filter((p) => p.inRound && !p.folded && !p.isYou);
+        if (round.showAllowed && others.length === 1 && Math.random() < 0.35) {
+          act(socket, roomId, 'SHOW', { targetUserId: others[0].userId });
+        } else if (!blind && round.sideShowAllowed && Math.random() < 0.12) {
           act(socket, roomId, 'SIDE_SHOW');
         } else if (Math.random() < 0.18 && me.legal.raise.allowed) {
           act(socket, roomId, 'RAISE', { amount: me.legal.chaal.amount * 2 });

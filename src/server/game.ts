@@ -22,14 +22,22 @@ import {
 } from '../rules/evaluate';
 import { RankingProfile, ResolvedRanking, resolveRanking } from '../rules/ranking';
 import { defaultProfile, standardProfile } from '../rules/profiles';
-import { DealingMode, RoundState } from '../rules/types';
+import {
+  DEALING_MODE_LABEL,
+  DealingMode,
+  GAME_TYPE_LABEL,
+  MULFIS_LAST_STAGE,
+  MULFIS_STAGE_ORDER,
+  RoundState,
+  cardsPerPlayer,
+  isPhysicalOnlyMode,
+} from '../rules/types';
 import {
   CardView,
   DEFAULT_RULES,
   DisputeView,
   HandResultView,
   MAX_SEATS,
-  MuflisRequestView,
   PlayerView,
   RoomRules,
   RoomView,
@@ -61,6 +69,7 @@ interface RoomRow {
   rules_json: string;
   ranking_profile_id: string;
   last_dealer_seat: number;
+  muflis_stage: number;
   created_at: string;
 }
 
@@ -98,7 +107,6 @@ interface RoundPlayerDoc {
   chipsAtStart: number;
   totalBet: number;
   bootPaid: boolean;
-  muflisVote: 'APPROVE' | 'REJECT' | null;
 }
 
 interface DisputeDoc {
@@ -137,13 +145,8 @@ export interface RoundDoc {
   betsMade: number;
   counterCount: number;
   muflis: boolean;
-  muflisRequest: {
-    by: string;
-    at: string;
-    approvals: string[];
-    rejections: string[];
-    status: 'PENDING' | 'APPROVED' | 'REJECTED';
-  } | null;
+  /** Position in the Muflis stage sequence (0 for a NORMAL game). */
+  muflisStage: number;
   show: { initiator: string; target: string; at: string } | null;
   sideShow: {
     initiator: string;
@@ -600,12 +603,6 @@ export class GameService {
       case 'RESPOND_SIDE_SHOW':
         this.roundAction(room, userId, type, payload);
         return;
-      case 'REQUEST_MUFLIS':
-        this.requestMuflis(room, userId);
-        return;
-      case 'VOTE_MUFLIS':
-        this.voteMuflis(room, userId, payload.approve === true);
-        return;
       case 'RAISE_CONFLICT':
         this.raiseConflict(room, userId, String(payload.reason ?? ''));
         return;
@@ -640,6 +637,11 @@ export class GameService {
     if (participants.length < 2) {
       throw new AppError(`At least two ready players with ${rules.boot} chips are needed to start.`, 'NOT_ENOUGH_PLAYERS');
     }
+    // A Muflis game walks its own stage sequence; a normal room uses its
+    // configured dealing mode. Both are resolved before the round is created.
+    const muflisGame = (rules.gameType ?? 'NORMAL') === 'MUFLIS';
+    const muflisStage = muflisGame ? Math.min(Math.max(0, room.muflis_stage ?? 0), MULFIS_LAST_STAGE) : 0;
+    if (muflisGame) rules.dealingMode = MULFIS_STAGE_ORDER[muflisStage];
     const profile = this.getProfile(room.ranking_profile_id) ?? defaultProfile();
     const ranking = this.resolvedFor(profile);
     const seq = (latest?.seq ?? 0) + 1;
@@ -684,8 +686,8 @@ export class GameService {
       turnSeat: firstToAct,
       betsMade: 0,
       counterCount: 0,
-      muflis: false,
-      muflisRequest: null,
+      muflis: muflisGame && muflisStage === MULFIS_LAST_STAGE,
+      muflisStage,
       show: null,
       sideShow: null,
       result: null,
@@ -725,7 +727,7 @@ export class GameService {
     doc.counterNeeded = false;
     this.log(
       doc,
-      `${rules.dealingMode === 'THREE_CARD' ? 'Three cards' : rules.dealingMode === 'TWO_CARD_ASSUMED' ? 'Two cards + assumed card' : 'One card + shared card'} dealt. Blind ${rules.boot}, seen chaal ${rules.boot * rules.seenMultiple}. ${doc.players.find((p) => p.seat === doc.turnSeat)?.name} to act.`,
+      `${DEALING_MODE_LABEL[rules.dealingMode]} dealt${(rules.gameType ?? 'NORMAL') === 'MUFLIS' ? ` (Muflis stage ${doc.muflisStage + 1}/${MULFIS_STAGE_ORDER.length})` : ''}. Blind ${rules.boot}, seen chaal ${rules.boot * rules.seenMultiple}. ${doc.players.find((p) => p.seat === doc.turnSeat)?.name} to act.`,
     );
     this.db.prepare('UPDATE rooms SET last_dealer_seat = ? WHERE id = ?').run(dealerSeat, room.id);
     this.saveDoc(doc);
@@ -746,7 +748,7 @@ export class GameService {
     const deck = shuffle(makeDeck());
     doc.deck = deck.map((c) => c.id);
     let index = 0;
-    const perPlayer = doc.rules.dealingMode === 'THREE_CARD' ? 3 : doc.rules.dealingMode === 'TWO_CARD_ASSUMED' ? 2 : 1;
+    const perPlayer = cardsPerPlayer(doc.rules.dealingMode);
     const ordered = doc.players.slice().sort((a, b) => a.seat - b.seat);
     for (let round = 0; round < perPlayer; round++) {
       for (const p of ordered) {
@@ -789,7 +791,7 @@ export class GameService {
 
     switch (type) {
       case 'SET_ASSUMED': {
-        if (doc.rules.dealingMode === 'THREE_CARD') {
+        if (isPhysicalOnlyMode(doc.rules.dealingMode)) {
           throw new AppError('This mode does not use an assumed card.', 'NO_ASSUMED_CARD');
         }
         if (REVEAL_STATES.includes(doc.state)) {
@@ -832,15 +834,39 @@ export class GameService {
             'SHOW_NOT_ALLOWED',
           );
         }
+
+        // A show request is not free: you must bet the same amount first, on
+        // your own turn.
+        const onTurn = doc.players.find((p) => p.seat === doc.turnSeat);
+        if (!onTurn || onTurn.userId !== userId) {
+          throw new AppError(
+            'Ask for a show on your own turn — the request also places your bet.',
+            'BET_FIRST',
+          );
+        }
+        const betState = this.toBetting(doc);
+        const { state: afterBet, event: betEvent } = applyBet(betState, userId, { type: 'CHAAL' });
+        this.fromBetting(doc, afterBet);
+        doc.lastBettorUserId = userId;
+        this.log(doc, `${player.name}: ${betEvent.note}. Pot ${doc.pot}.`);
+        if (afterBet.roundOver) {
+          const alive = doc.players.filter((p) => p.inRound && !p.folded);
+          this.resolveLastPlayer(doc, alive[0]);
+          this.saveDoc(doc);
+          return;
+        }
+        if (doc.rules.maxBetsPerRound > 0 && doc.betsMade >= doc.rules.maxBetsPerRound) {
+          this.resolveCapShowdown(doc);
+          this.saveDoc(doc);
+          return;
+        }
+
         doc.show = { initiator: userId, target: targetId, at: nowIso() };
         doc.state = 'SHOW_REQUESTED';
-        this.log(doc, `${player.name} requested a show against ${target.name}.`);
+        this.log(doc, `${player.name} bet ${betEvent.amount} and requested a show against ${target.name}.`);
         this.resolveShowdown(doc, userId, targetId, 'SHOW');
         return;
       }
-      case 'REQUEST_MUFLIS':
-        this.requestMuflis(room, userId);
-        return;
       default: {
         if (doc.state !== 'BETTING') {
           throw new AppError('Betting is paused.', 'BETTING_PAUSED');
@@ -901,8 +927,7 @@ export class GameService {
     targetName: string | null;
     allowed: boolean;
     reason: string | null;
-  } {
-    const none = { targetUserId: null, targetName: null, allowed: false, reason: null as string | null };
+  } {    const none = { targetUserId: null, targetName: null, allowed: false, reason: null as string | null };
     if (doc.state !== 'BETTING') return none;
     const active = doc.players.filter((p) => p.inRound && !p.folded);
     if (active.length < 3) return none;
@@ -923,6 +948,20 @@ export class GameService {
       return { ...base, reason: `${prev.name} has not seen their cards, so a side show is not allowed.` };
     }
     return { ...base, allowed: true };
+  }
+
+  /** A full show needs two players left and must be asked on your own turn. */
+  private showInfo(doc: RoundDoc | null, viewerId: string): { allowed: boolean; reason: string | null } {
+    if (!doc || doc.state !== 'BETTING') return { allowed: false, reason: null };
+    const active = doc.players.filter((p) => p.inRound && !p.folded);
+    if (active.length !== 2) return { allowed: false, reason: null };
+    const me = active.find((p) => p.userId === viewerId);
+    if (!me) return { allowed: false, reason: null };
+    const onTurn = doc.players.find((p) => p.seat === doc.turnSeat);
+    if (!onTurn || onTurn.userId !== viewerId) {
+      return { allowed: false, reason: 'You can only ask for a show on your own turn.' };
+    }
+    return { allowed: true, reason: null };
   }
 
   private requestSideShow(doc: RoundDoc, userId: string): void {
@@ -1027,8 +1066,8 @@ export class GameService {
     const showdown = decideShowdown(handA, handB, {
       ranking,
       muflis: doc.muflis,
-      mode: doc.rules.dealingMode,
-      threeCardCompare: doc.rules.threeCardCompare,
+      mode: isPhysicalOnlyMode(doc.rules.dealingMode) ? 'THREE_CARD' : doc.rules.dealingMode,
+      threeCardCompare: isPhysicalOnlyMode(doc.rules.dealingMode) ? 'FULL_HAND' : doc.rules.threeCardCompare,
       initiator: 'a',
       sharedCardId: doc.sharedCardId ?? undefined,
     });
@@ -1072,67 +1111,6 @@ export class GameService {
     this.saveDoc(doc);
   }
 
-  private requestMuflis(room: RoomRow, userId: string): void {
-    const doc = this.currentDoc(room.id, ['BETTING']);
-    if (!doc.rules.allowMidRoundMuflis) throw new AppError('Mid-round Muflis is disabled in this room.', 'MULFIS_DISABLED');
-    if (doc.muflis) throw new AppError('This round is already Muflis.', 'ALREADY_MUFLIS');
-    if (REVEAL_STATES.includes(doc.state)) throw new AppError('A Muflis switch is not allowed after the reveal.', 'MULFIS_TOO_LATE');
-    if (doc.muflisRequest && doc.muflisRequest.status === 'PENDING') {
-      throw new AppError('A Muflis request is already pending.', 'MULFIS_PENDING');
-    }
-    const player = doc.players.find((p) => p.userId === userId);
-    if (!player || player.folded) throw new AppError('Only active players can request Muflis.', 'NOT_ACTIVE');
-    doc.muflisRequest = { by: userId, at: nowIso(), approvals: [], rejections: [], status: 'PENDING' };
-    for (const p of doc.players) p.muflisVote = null;
-    player.muflisVote = 'APPROVE';
-    doc.state = 'MUFLIS_PENDING';
-    this.log(doc, `${player.name} requested a Muflis switch. Betting is paused.`);
-    this.saveDoc(doc);
-  }
-
-  private voteMuflis(room: RoomRow, userId: string, approve: boolean): void {
-    const doc = this.currentDoc(room.id, ['MUFLIS_PENDING']);
-    const request = doc.muflisRequest;
-    if (!request || request.status !== 'PENDING') throw new AppError('There is no pending Muflis request.', 'NO_MULFIS_REQUEST');
-
-    if (doc.rules.muflisApproval === 'ADMIN') {
-      this.requireAdmin(room, userId);
-      const adminName = (this.db.prepare('SELECT name FROM users WHERE id = ?').get(userId) as { name: string } | undefined)?.name ?? 'the administrator';
-      this.applyMuflisDecision(doc, () => adminName, approve);
-      this.saveDoc(doc);
-      return;
-    }
-
-    const player = doc.players.find((p) => p.userId === userId);
-    if (!player || player.folded || !player.inRound) throw new AppError('Only active players can vote.', 'NOT_ACTIVE');
-
-    // Unanimous approval by all active players.
-    player.muflisVote = approve ? 'APPROVE' : 'REJECT';
-    const active = doc.players.filter((p) => p.inRound && !p.folded);
-    request.approvals = active.filter((p) => p.muflisVote === 'APPROVE').map((p) => p.userId);
-    request.rejections = active.filter((p) => p.muflisVote === 'REJECT').map((p) => p.userId);
-    if (request.rejections.length > 0) {
-      this.applyMuflisDecision(doc, () => player.name, false);
-    } else if (request.approvals.length === active.length) {
-      this.applyMuflisDecision(doc, () => 'all active players', true);
-    }
-    this.saveDoc(doc);
-  }
-
-  private applyMuflisDecision(doc: RoundDoc, approverName: (fallback: string) => string, approve: boolean): void {
-    const request = doc.muflisRequest!;
-    const by = doc.players.find((p) => p.userId === request.by);
-    request.status = approve ? 'APPROVED' : 'REJECTED';
-    if (approve) {
-      doc.muflis = true;
-      this.log(doc, `Muflis APPROVED by ${approverName('the administrator')} (requested by ${by?.name ?? 'a player'}) at ${nowIso()}.`);
-    } else {
-      this.log(doc, `Muflis request from ${by?.name ?? 'a player'} was rejected. The round continues as Normal.`);
-    }
-    doc.state = 'BETTING';
-    for (const p of doc.players) p.muflisVote = p.muflisVote ?? null;
-  }
-
   /* ---------------------------------------------------------------- */
   /* Showdown / settlement                                            */
   /* ---------------------------------------------------------------- */
@@ -1140,7 +1118,8 @@ export class GameService {
   private buildHand(doc: RoundDoc, player: RoundPlayerDoc, ranking: ResolvedRanking): EvaluatedHand {
     const mode: DealingMode = doc.rules.dealingMode;
     const physical = player.cards.map(cardFromId);
-    if (mode === 'THREE_CARD') return evaluateHand(physical, ranking);
+    // Three-card and four-card modes use only physical cards (best three of four).
+    if (isPhysicalOnlyMode(mode)) return evaluateHand(physical, ranking);
     const shared = doc.sharedCardId ? cardFromId(doc.sharedCardId) : undefined;
     const pool = shared ? [...physical, shared] : physical;
     if (player.assumedRank === null) {
@@ -1163,8 +1142,8 @@ export class GameService {
     const showdown = decideShowdown(handA, handB, {
       ranking,
       muflis: doc.muflis,
-      mode: doc.rules.dealingMode,
-      threeCardCompare: doc.rules.threeCardCompare,
+      mode: isPhysicalOnlyMode(doc.rules.dealingMode) ? 'THREE_CARD' : doc.rules.dealingMode,
+      threeCardCompare: isPhysicalOnlyMode(doc.rules.dealingMode) ? 'FULL_HAND' : doc.rules.threeCardCompare,
       initiator: 'a',
       sharedCardId: doc.sharedCardId ?? undefined,
     });
@@ -1369,6 +1348,28 @@ export class GameService {
     this.broadcast(roomId);
   }
 
+  /**
+   * Muflis only moves on when the round was **shown**: without a show the
+   * same stage (and, in the last stage, the reversed ranking) repeats.
+   */
+  private advanceMuflisStage(doc: RoundDoc, result: RoundResultView): void {
+    if ((doc.rules.gameType ?? 'NORMAL') !== 'MUFLIS') return;
+    if (result.kind === 'ADMIN_VOID') return;
+    const shown = !!result.hands && result.hands.length > 0;
+    if (!shown) {
+      this.log(doc, 'No show, so the Muflis stage stays the same.');
+      return;
+    }
+    const next = (doc.muflisStage + 1) % MULFIS_STAGE_ORDER.length;
+    this.db.prepare('UPDATE rooms SET muflis_stage = ? WHERE id = ?').run(next, doc.roomId);
+    this.log(
+      doc,
+      `Muflis stage ${doc.muflisStage + 1}/${MULFIS_STAGE_ORDER.length} was shown, so the game moves to stage ${
+        next + 1
+      }: ${DEALING_MODE_LABEL[MULFIS_STAGE_ORDER[next]]}${next === MULFIS_LAST_STAGE ? ' with reversed ranking' : ''}.`,
+    );
+  }
+
   /** Pays out the pot exactly once (chip transaction keys make it idempotent). */
   private finalize(doc: RoundDoc, result: RoundResultView, split: boolean): void {
     if (doc.state === 'SETTLED') return;
@@ -1419,6 +1420,7 @@ export class GameService {
     doc.result = result;
     doc.settledAt = nowIso();
     this.log(doc, `Round settled. ${result.reason}`);
+    this.advanceMuflisStage(doc, result);
     this.db.prepare('UPDATE room_members SET ready = 0 WHERE room_id = ?').run(doc.roomId);
     const summary: RoundSummary = {
       roundId: doc.id,
@@ -1567,7 +1569,7 @@ export class GameService {
   private peekLabel(doc: RoundDoc, player: RoundPlayerDoc, ranking: ResolvedRanking): string | null {
     try {
       const physical = player.cards.map(cardFromId);
-      if (doc.rules.dealingMode === 'THREE_CARD') return evaluateHand(physical, ranking).label;
+      if (isPhysicalOnlyMode(doc.rules.dealingMode)) return evaluateHand(physical, ranking).label;
       const shared = doc.sharedCardId ? cardFromId(doc.sharedCardId) : undefined;
       if (player.assumedRank === null) return null;
       const cards = shared ? [...physical, shared] : physical;
@@ -1596,6 +1598,7 @@ export class GameService {
     const sideShowInfo = doc
       ? this.sideShowInfo(doc, viewerId)
       : { targetUserId: null, targetName: null, allowed: false, reason: null };
+    const showInfo = this.showInfo(doc, viewerId);
     // A side show reveals cards only once the invited player has accepted.
     const sideShowPair =
       doc?.sideShow &&
@@ -1626,7 +1629,7 @@ export class GameService {
           : null;
       // You must look at your cards before you can choose an assumed card.
       const canAssume =
-        !!rp && !!doc && doc.rules.dealingMode !== 'THREE_CARD' && !revealed && isYou && !rp.blind;
+        !!rp && !!doc && !isPhysicalOnlyMode(doc.rules.dealingMode) && !revealed && isYou && !rp.blind;
       const shared = doc?.sharedCardId ? cardFromId(doc.sharedCardId) : null;
 
       const handLabel = rp && ranking && showCards && !rp.blind ? this.peekLabel(doc!, rp, ranking) : null;
@@ -1653,10 +1656,8 @@ export class GameService {
         totalBet: rp ? rp.totalBet : 0,
         isTurn: !!doc && doc.turnSeat === m.seat && doc.state === 'BETTING',
         legal,
-        muflisVote: rp?.muflisVote ?? null,
         handLabel,
         chipsAtStart: rp ? rp.chipsAtStart : null,
-        muflisPending: !!doc?.muflisRequest && doc.muflisRequest.status === 'PENDING' && rp?.muflisVote === null,
       };
     });
 
@@ -1694,16 +1695,6 @@ export class GameService {
                 : null,
           }
         : null;
-      const muflisRequest: MuflisRequestView | null = doc.muflisRequest        ? {
-            by: doc.muflisRequest.by,
-            byName: doc.players.find((p) => p.userId === doc.muflisRequest!.by)?.name ?? '',
-            at: doc.muflisRequest.at,
-            approvals: doc.muflisRequest.approvals,
-            rejections: doc.muflisRequest.rejections,
-            needed: doc.players.filter((p) => p.inRound && !p.folded).map((p) => p.userId),
-            policy: doc.rules.muflisApproval,
-          }
-        : null;
       const dispute: DisputeView | null = doc.dispute
         ? {
             id: doc.dispute.id,
@@ -1728,10 +1719,20 @@ export class GameService {
         sideShowTargetName: sideShowInfo.targetName,
         sideShowAllowed: sideShowInfo.allowed,
         sideShowBlockedReason: sideShowInfo.reason,
+        showAllowed: showInfo.allowed,
+        showBlockedReason: showInfo.reason,
         survivorUserId: doc.survivorUserId ?? null,
         survivorName: doc.survivorUserId ? (doc.players.find((p) => p.userId === doc.survivorUserId)?.name ?? null) : null,
         turnSeat: doc.state === 'BETTING' ? doc.turnSeat : null,
         muflis: doc.muflis,
+        gameType: doc.rules.gameType ?? 'NORMAL',
+        muflisStage: doc.muflisStage ?? 0,
+        muflisStageLabel:
+          (doc.rules.gameType ?? 'NORMAL') === 'MUFLIS'
+            ? `Muflis stage ${(doc.muflisStage ?? 0) + 1}/${MULFIS_STAGE_ORDER.length} — ${
+                DEALING_MODE_LABEL[doc.rules.dealingMode]
+              }${doc.muflis ? ', reversed ranking' : ''}`
+            : null,
         dealingMode: doc.rules.dealingMode,
         threeCardCompare: doc.rules.threeCardCompare,
         boot: doc.rules.boot,
@@ -1739,7 +1740,6 @@ export class GameService {
         sharedCard: sharedCard ? { rank: sharedCard.rank, suit: sharedCard.suit } : null,
         show,
         sideShow,
-        muflisRequest,
         revealed,
         result: doc.result,
         provisionalUntil: doc.provisionalUntil,
@@ -1810,15 +1810,13 @@ function sanitiseRules(input: RoomRules): RoomRules {
   rules.disputeWindowSeconds = Math.max(0, Math.min(600, Math.floor(Number(rules.disputeWindowSeconds) || 0)));
   rules.maxPlayers = Math.max(2, Math.min(MAX_SEATS, Math.floor(Number(rules.maxPlayers) || 2)));
   rules.startingChips = Math.max(rules.boot, Math.floor(Number(rules.startingChips) || 1000));
-  if (rules.dealingMode !== 'THREE_CARD' && rules.dealingMode !== 'TWO_CARD_ASSUMED' && rules.dealingMode !== 'ONE_CARD_SHARED') {
-    rules.dealingMode = 'THREE_CARD';
-  }
+  if (!(rules.dealingMode in DEALING_MODE_LABEL)) rules.dealingMode = 'THREE_CARD';
   if (rules.threeCardCompare !== 'FULL_HAND' && rules.threeCardCompare !== 'HIGHEST_CARD') {
     rules.threeCardCompare = 'FULL_HAND';
   }
   if (rules.bootMode !== 'FULL' && rules.bootMode !== 'ROUND') rules.bootMode = 'FULL';
   if (rules.roundBootScope !== 'FIRST_TO_ACT' && rules.roundBootScope !== 'EACH_TURN') rules.roundBootScope = 'FIRST_TO_ACT';
-  if (rules.muflisApproval !== 'ADMIN' && rules.muflisApproval !== 'UNANIMOUS') rules.muflisApproval = 'ADMIN';
+  if (rules.gameType !== 'MUFLIS') rules.gameType = 'NORMAL';
   if (rules.remainderRule !== 'LOWEST_SEAT' && rules.remainderRule !== 'INITIATOR') rules.remainderRule = 'LOWEST_SEAT';
   rules.maxBetsPerRound = Math.max(0, Math.min(500, Math.floor(Number(rules.maxBetsPerRound) || 0)));
   return rules;

@@ -65,9 +65,43 @@ export function handVariantOf(cards: readonly Card[]): { variant: HandVariant; i
 }
 
 export function evaluateHand(cards: readonly Card[], ranking: ResolvedRanking): EvaluatedHand {
+  if (cards.length === 4) return bestThreeOfFour(cards, ranking);
   if (cards.length !== 3) {
     throw new RulesError(`A comparison hand must contain exactly 3 cards, received ${cards.length}.`, 'BAD_HAND');
   }
+  return evaluateTriple(cards, ranking);
+}
+
+/**
+ * Four-card mode: the player automatically plays the **best three** of their
+ * four cards, scored with the normal three-card ranking.
+ */
+export function bestThreeOfFour(cards: readonly Card[], ranking: ResolvedRanking): EvaluatedHand {
+  let best: EvaluatedHand | null = null;
+  for (let skip = 0; skip < cards.length; skip++) {
+    const candidate = evaluateTriple(
+      cards.filter((_, index) => index !== skip),
+      ranking,
+    );
+    if (!best || compareEvaluated(candidate, best, ranking) < 0) best = candidate;
+  }
+  return best!;
+}
+
+/** Negative when `a` is the stronger hand (0 strongest class, lower is better). */
+function compareEvaluated(a: EvaluatedHand, b: EvaluatedHand, ranking: ResolvedRanking): number {
+  if (a.classIndex !== b.classIndex) return a.classIndex - b.classIndex;
+  if (a.suitKey && b.suitKey) {
+    const len = Math.min(a.suitKey.length, b.suitKey.length);
+    for (let i = 0; i < len; i++) {
+      if (a.suitKey[i] !== b.suitKey[i]) return a.suitKey[i] - b.suitKey[i];
+    }
+  }
+  void ranking;
+  return 0;
+}
+
+function evaluateTriple(cards: readonly Card[], ranking: ResolvedRanking): EvaluatedHand {
   const sorted = sortCardsDesc(cards, ranking.suitOrder);
   const ranks = sorted.map((c) => c.rank);
   const { variant, isFlush } = handVariantOf(sorted);

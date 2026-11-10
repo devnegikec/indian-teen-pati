@@ -36,6 +36,33 @@ function beats(a: Card[], b: Card[], muflis = false, mode: DealingMode = 'THREE_
 
 const H = Object.fromEntries(REQUIRED_ORDER_HANDS.map((h) => [h.label, h.cards]));
 
+describe('four-card mode', () => {
+  it('automatically plays the best three of the four cards dealt', () => {
+    const hand = evaluateHand(cardsOf('S14', 'H14', 'D14', 'S2'), ranking);
+    expect(hand.cards.length).toBe(3);
+    expect(hand.variant).toBe('TRAIL');
+    expect(hand.ranks).toEqual([14, 14, 14]);
+  });
+
+  it('keeps a made hand and drops the odd card', () => {
+    // S14 S13 S12 + H2 -> pure sequence, not a colour
+    const straightFlush = evaluateHand(cardsOf('S14', 'S13', 'S12', 'H2'), ranking);
+    expect(straightFlush.variant).toBe('PURE_SEQUENCE');
+    // S13 H13 D2 C3 -> keeps the pair (K K 3) and drops the 2
+    const pair = evaluateHand(cardsOf('S13', 'H13', 'D2', 'C3'), ranking);
+    expect(pair.variant).toBe('PAIR');
+    // S4 S9 S11 S2 -> four spades, so the best three make a colour
+    const colour = evaluateHand(cardsOf('S4', 'S9', 'S11', 'S2'), ranking);
+    expect(colour.variant).toBe('COLOUR');
+  });
+
+  it('is stronger than the same three cards alone would be', () => {
+    const four = evaluateHand(cardsOf('S14', 'H14', 'D14', 'S2'), ranking);
+    const three = hand('S14', 'H14', 'S2');
+    expect(four.classIndex).toBeLessThan(three.classIndex);
+  });
+});
+
 describe('required custom ranking chain', () => {
   it('orders 222 > 235 > AKQ > AKJ > A109 > KQJ in Normal mode', () => {
     const chain = ['222', '235', 'AKQ', 'AKJ', 'A109', 'KQJ'];

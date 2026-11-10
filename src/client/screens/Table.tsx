@@ -203,34 +203,10 @@ export function Table({ roomId }: { roomId: string }) {
                 )}
               </div>
             )}
-            {round?.muflisRequest && round.state === 'MUFLIS_PENDING' && (
-              <div className="notice notice--warn">
-                <strong>{round.muflisRequest.byName}</strong> requested a Muflis switch. Betting is paused.
-                {round.muflisRequest.policy === 'UNANIMOUS' && (
-                  <div className="small">
-                    Approvals {round.muflisRequest.approvals.length}/{round.muflisRequest.needed.length}
-                  </div>
-                )}
-                {round.muflisRequest.policy === 'UNANIMOUS' && me?.inRound && !me.folded && (
-                  <div className="row">
-                    <button className="btn btn--small btn--primary" onClick={() => send('VOTE_MUFLIS', { approve: true })}>
-                      Approve
-                    </button>
-                    <button className="btn btn--small" onClick={() => send('VOTE_MUFLIS', { approve: false })}>
-                      Reject
-                    </button>
-                  </div>
-                )}
-                {round.muflisRequest.policy === 'ADMIN' && isAdmin && (
-                  <div className="row">
-                    <button className="btn btn--small btn--primary" onClick={() => send('VOTE_MUFLIS', { approve: true })}>
-                      Approve Muflis
-                    </button>
-                    <button className="btn btn--small" onClick={() => send('VOTE_MUFLIS', { approve: false })}>
-                      Reject
-                    </button>
-                  </div>
-                )}
+            {round?.muflisStageLabel && (
+              <div className="notice notice--info small">
+                <strong>{round.muflisStageLabel}</strong>
+                {round.muflis ? ' — the weakest hand wins this stage.' : ''}
               </div>
             )}
           </div>
@@ -384,8 +360,17 @@ export function Table({ roomId }: { roomId: string }) {
                   </button>
                 </div>
                 {activePlayers.length === 2 ? (
-                  <button className="btn btn--ghost" onClick={() => setShowPicker(true)}>
-                    Request show (ends the round)
+                  <button
+                    className="btn btn--ghost"
+                    disabled={!round.showAllowed}
+                    title={
+                      round.showBlockedReason ??
+                      'A show request is not free — your bet is placed first, then both hands are compared'
+                    }
+                    onClick={() => setShowPicker(true)}
+                  >
+                    {me.legal ? `Bet ${me.legal.chaal.amount} & request show` : 'Request show'}{' '}
+                    (ends the round)
                   </button>
                 ) : (
                   <button
@@ -401,11 +386,6 @@ export function Table({ roomId }: { roomId: string }) {
                       ? `Bet ${me.legal.chaal.amount} & request side show`
                       : 'Request side show'}
                     {round.sideShowTargetName ? ` with ${round.sideShowTargetName}` : ''}
-                  </button>
-                )}
-                {!round.muflis && room.rules.allowMidRoundMuflis && (
-                  <button className="btn btn--ghost" onClick={() => send('REQUEST_MUFLIS')}>
-                    Request Muflis
                   </button>
                 )}
                 {me.blind && (
@@ -622,8 +602,8 @@ export function Table({ roomId }: { roomId: string }) {
           <div className="modal__card" onClick={(e) => e.stopPropagation()}>
             <h3>Show your cards to…</h3>
             <p className="muted small">
-              With two players left, a full show ends the round: both hands are compared and the winner takes
-              the pot.
+              A show request is not free: your normal bet is placed first, then both hands are compared and
+              the winner takes the pot.
             </p>
             {activePlayers
               .filter((p) => !p.isYou)
@@ -722,7 +702,6 @@ function AdminPanel({ view, send }: { view: RoomView; send: (type: string, paylo
     dealingMode: view.room.rules.dealingMode,
     threeCardCompare: view.room.rules.threeCardCompare,
     bootMode: view.room.rules.bootMode,
-    muflisApproval: view.room.rules.muflisApproval,
     counterMultiplier: view.room.rules.counterMultiplier,
     seenMultiple: view.room.rules.seenMultiple,
     disputeWindowSeconds: view.room.rules.disputeWindowSeconds,
@@ -797,15 +776,8 @@ function AdminPanel({ view, send }: { view: RoomView; send: (type: string, paylo
           </select>
         </label>
         <label className="field">
-          <span>Muflis approval</span>
-          <select
-            className="input"
-            value={rules.muflisApproval}
-            onChange={(e) => setRules({ ...rules, muflisApproval: e.target.value as 'ADMIN' | 'UNANIMOUS' })}
-          >
-            <option value="ADMIN">Administrator</option>
-            <option value="UNANIMOUS">Unanimous</option>
-          </select>
+          <span>Game</span>
+          <input className="input" value={view.room.rules.gameType} readOnly />
         </label>
         <label className="field">
           <span>Counter multiplier</span>

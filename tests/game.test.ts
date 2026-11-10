@@ -245,6 +245,25 @@ describe('assumed card modes', () => {
     expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SET_ASSUMED', { rank: 2 })).toThrow();
   });
 
+    it('charges the requester bet when a full show is requested', () => {
+    const ctx = setup({}, 2);
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    const [onTurn, other] = order(ctx);
+    // a show request is not free, so it can only be made on your own turn
+    expect(() => ctx.game.handleAction(ctx.roomId, other, 'SHOW', { targetUserId: onTurn })).toThrow(
+      /your own turn/i,
+    );
+    const before = view(ctx, onTurn).players.find((p) => p.userId === onTurn)!;
+    const requirement = before.legal!.chaal.amount;
+    const potBefore = pot(ctx, ctx.admin);
+    ctx.game.handleAction(ctx.roomId, onTurn, 'SHOW', { targetUserId: other });
+    const v = view(ctx, ctx.admin);
+    expect(v.round?.state).toBe('PROVISIONAL');
+    // the bet was placed before the comparison
+    expect(pot(ctx, ctx.admin)).toBe(potBefore + requirement);
+    expect(v.round?.log.some((l) => new RegExp(`${before.name}: .*${requirement}`).test(l.text))).toBe(true);
+  });
+
   it('only allows a full show when two players are left and offers a side show otherwise', () => {
     const ctx = setup({ dealingMode: 'TWO_CARD_ASSUMED' }, 3);
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
@@ -342,52 +361,107 @@ describe('assumed card modes', () => {
   });
 });
 
-describe('Muflis policy', () => {
-  it('does not change the game when the request is not approved', () => {
+describe('Muflis game', () => {
+  /** Re-ready both players so the next round can start. */
+  function ready(ctx: Ctx) {
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'READY', { ready: true });
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'READY', { ready: true });
+  }
+
+  it('is a game type, not a request: no Muflis actions exist', () => {
     const ctx = setup();
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'REQUEST_MUFLIS', {});
-    let v = view(ctx, ctx.admin);
-    expect(v.round?.state).toBe('MUFLIS_PENDING');
-    expect(v.round?.muflis).toBe(false);
-    // betting is paused
-    expect(() => ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'CHAAL', {})).toThrow();
-    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'VOTE_MUFLIS', { approve: false });
-    v = view(ctx, ctx.admin);
-    expect(v.round?.muflis).toBe(false);
-    expect(v.round?.state).toBe('BETTING');
-  });
-
-  it('switches the round to Muflis on approval and keeps the pot', () => {
-    const ctx = setup();
-    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {});
-    const potBefore = view(ctx, ctx.admin).round!.pot;
-    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'REQUEST_MUFLIS', {});
-    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'VOTE_MUFLIS', { approve: true });
-    const v = view(ctx, ctx.admin);
-    expect(v.round?.muflis).toBe(true);
-    expect(v.round?.pot).toBe(potBefore);
-    expect(v.round?.log.some((l) => /Muflis APPROVED/i.test(l.text))).toBe(true);
-  });
-
-  it('supports unanimous approval by all active players', () => {
-    const ctx = setup({ muflisApproval: 'UNANIMOUS' });
-    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'REQUEST_MUFLIS', {});
-    // one approval is not enough
-    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'VOTE_MUFLIS', { approve: true });
-    expect(view(ctx, ctx.admin).round?.muflis).toBe(false);
-    expect(view(ctx, ctx.admin).round?.state).toBe('MUFLIS_PENDING');
-    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'VOTE_MUFLIS', { approve: true });
-    expect(view(ctx, ctx.admin).round?.muflis).toBe(true);
-  });
-
-  it('rejects a Muflis request once cards are revealed', () => {
-    const ctx = setup({ dealingMode: 'TWO_CARD_ASSUMED' }, 2);
-    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SHOW', { targetUserId: ctx.admin.userId });
     expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'REQUEST_MUFLIS', {})).toThrow();
+    expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'VOTE_MUFLIS', { approve: true })).toThrow();
+    const v = view(ctx, ctx.admin).round!;
+    expect(v.gameType).toBe('NORMAL');
+    expect(v.muflisStage).toBe(0);
+    expect(v.muflisStageLabel).toBeNull();
+    expect(v.muflis).toBe(false);
+  });
+
+  it('deals four cards in the first stage and plays the best three', () => {
+    const ctx = setup({ gameType: 'MUFLIS' }, 2);
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    const v = view(ctx, ctx.admin).round!;
+    expect(v.gameType).toBe('MUFLIS');
+    expect(v.muflisStage).toBe(0);
+    expect(v.dealingMode).toBe('FOUR_CARD_BEST_THREE');
+    expect(v.muflisStageLabel).toContain('1/4');
+    expect(v.muflis).toBe(false);
+    const players = view(ctx, ctx.admin).players;
+    expect(players.every((p) => p.cards.length === 4)).toBe(true);
+    // four physical cards, so no assumed card is offered
+    expect(players.every((p) => p.legalAssumedRanks === null)).toBe(true);
+  });
+
+  it('walks the four stages and only moves on when a round is shown', () => {
+    const ctx = setup({ gameType: 'MUFLIS' }, 2);
+    const stages = ['FOUR_CARD_BEST_THREE', 'TWO_CARD_ASSUMED', 'ONE_CARD_SHARED', 'THREE_CARD'];
+
+    // Round 1: everyone folds, the winner takes the pot without showing.
+    ready(ctx);
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    const [first, second] = order(ctx);
+    ctx.game.handleAction(ctx.roomId, first, 'FOLD', {});
+    ctx.game.handleAction(ctx.roomId, second, 'WINNER_ACTION', { show: false });
+    ctx.game.settleRound(ctx.roomId, true);
+    expect(view(ctx, ctx.admin).round?.result?.hands?.length ?? 0).toBe(0);
+
+    // Still stage 1: no show, so the stage does not move.
+    ready(ctx);
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    let v = view(ctx, ctx.admin).round!;
+    expect(v.muflisStage).toBe(0);
+    expect(v.dealingMode).toBe('FOUR_CARD_BEST_THREE');
+    // Show this one: the requester pays the bet, then the stage advances.
+    const [onTurn, other] = order(ctx);
+    ctx.game.handleAction(ctx.roomId, onTurn, 'SHOW', { targetUserId: other });
+    expect(view(ctx, ctx.admin).round?.result?.hands?.length).toBe(2);
+    ctx.game.settleRound(ctx.roomId, true);
+
+    for (let stage = 1; stage < stages.length; stage++) {
+      ready(ctx);
+      ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+      v = view(ctx, ctx.admin).round!;
+      expect(v.muflisStage).toBe(stage);
+      expect(v.dealingMode).toBe(stages[stage]);
+      // the final stage is three-card with reversed (weakest-wins) ranking
+      expect(v.muflis).toBe(stage === stages.length - 1);
+      const [a2, b2] = order(ctx);
+      ctx.game.handleAction(ctx.roomId, a2, 'SHOW', { targetUserId: b2 });
+      ctx.game.settleRound(ctx.roomId, true);
+    }
+
+    // Once the last stage is shown the game starts again at stage 1.
+    ready(ctx);
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    expect(view(ctx, ctx.admin).round?.muflisStage).toBe(0);
+    expect(view(ctx, ctx.admin).round?.dealingMode).toBe('FOUR_CARD_BEST_THREE');
+  });
+
+  it('decides the final stage with reversed ranking', () => {
+    const ctx = setup({ gameType: 'MUFLIS' }, 2);
+    const readyBoth = () => {
+      ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'READY', { ready: true });
+      ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'READY', { ready: true });
+    };
+    for (let stage = 0; stage < 3; stage++) {
+      readyBoth();
+      ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+      const [a1, b1] = order(ctx);
+      ctx.game.handleAction(ctx.roomId, a1, 'SHOW', { targetUserId: b1 });
+      ctx.game.settleRound(ctx.roomId, true);
+    }
+    readyBoth();
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    const last = view(ctx, ctx.admin).round!;
+    expect(last.muflis).toBe(true);
+    expect(last.dealingMode).toBe('THREE_CARD');
+    const [a2, b2] = order(ctx);
+    ctx.game.handleAction(ctx.roomId, a2, 'SHOW', { targetUserId: b2 });
+    const result = view(ctx, ctx.admin).round!.result!;
+    expect(result.reason).toMatch(/muflis/i);
   });
 });
 

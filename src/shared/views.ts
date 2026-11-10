@@ -4,7 +4,7 @@
  */
 
 import type { LegalActions } from '../rules/betting';
-import type { BootMode, DealingMode, MuflisApproval, RoundState, ThreeCardCompare } from '../rules/types';
+import type { BootMode, DealingMode, GameType, RoundState, ThreeCardCompare } from '../rules/types';
 
 export const MAX_SEATS = 6;
 
@@ -19,10 +19,15 @@ export interface RoomRules {
   bootMode: BootMode;
   /** Only used with ROUND boot mode. */
   roundBootScope: RoundBootScope;
+  /**
+   * Normal Teen Patti, or a Muflis game. Muflis is a game type chosen when the
+   * room is created - it is never requested mid-round. `dealingMode` is only
+   * used in NORMAL rooms; a Muflis game walks its own stage sequence.
+   */
+  gameType: GameType;
   dealingMode: DealingMode;
   /** Explicit; never inferred. Only meaningful for THREE_CARD. */
   threeCardCompare: ThreeCardCompare;
-  muflisApproval: MuflisApproval;
   counterMultiplier: number;
   /** Seen player pays level × seenMultiple (double by default). */
   seenMultiple: number;
@@ -30,7 +35,6 @@ export interface RoomRules {
   remainderRule: RemainderRule;
   maxPlayers: number;
   startingChips: number;
-  allowMidRoundMuflis: boolean;
   /**
    * Safety valve against endless blind-chaal loops: when this many bets have
    * been made the hands are opened automatically. 0 disables the cap.
@@ -43,16 +47,15 @@ export const DEFAULT_RULES: RoomRules = {
   minBoot: 10,
   bootMode: 'FULL',
   roundBootScope: 'FIRST_TO_ACT',
+  gameType: 'NORMAL',
   dealingMode: 'THREE_CARD',
   threeCardCompare: 'FULL_HAND',
-  muflisApproval: 'ADMIN',
   counterMultiplier: 3,
   seenMultiple: 2,
   disputeWindowSeconds: 15,
   remainderRule: 'LOWEST_SEAT',
   maxPlayers: MAX_SEATS,
   startingChips: 5000,
-  allowMidRoundMuflis: true,
   maxBetsPerRound: 24,
 };
 
@@ -86,10 +89,8 @@ export interface PlayerView {
   isTurn: boolean;
   /** Populated only for the requesting player. */
   legal: LegalActions | null;
-  muflisVote: 'APPROVE' | 'REJECT' | null;
   handLabel: string | null;
   chipsAtStart: number | null;
-  muflisPending?: boolean;
 }
 
 export interface ShowInfo {
@@ -122,16 +123,6 @@ export interface SideShowView {
     reason: string;
     hands: HandResultView[];
   } | null;
-}
-
-export interface MuflisRequestView {
-  by: string;
-  byName: string;
-  at: string;
-  approvals: string[];
-  rejections: string[];
-  needed: string[];
-  policy: MuflisApproval;
 }
 
 export interface HandResultView {
@@ -187,11 +178,21 @@ export interface RoundView {
   /** Whether *you* may ask for a side show right now, and why not if you cannot. */
   sideShowAllowed: boolean;
   sideShowBlockedReason: string | null;
+  /** Whether *you* may ask for a full show (two players left, your turn). */
+  showAllowed: boolean;
+  showBlockedReason: string | null;
   /** Set while the last standing player decides whether to show their cards. */
   survivorUserId: string | null;
   survivorName: string | null;
   turnSeat: number | null;
+  /** True when the weakest hand wins (Muflis final stage). */
   muflis: boolean;
+  /** NORMAL or MUFLIS - chosen when the room was created. */
+  gameType: GameType;
+  /** Position in the Muflis stage sequence (0-based); always 0 for NORMAL. */
+  muflisStage: number;
+  /** Human-readable stage, e.g. "Stage 4/4 - three-card, reversed ranking". */
+  muflisStageLabel: string | null;
   dealingMode: DealingMode;
   threeCardCompare: ThreeCardCompare;
   boot: number;
@@ -199,7 +200,6 @@ export interface RoundView {
   sharedCard: CardView | null;
   show: ShowInfo | null;
   sideShow: SideShowView | null;
-  muflisRequest: MuflisRequestView | null;
   revealed: boolean;
   result: RoundResultView | null;
   provisionalUntil: number | null;

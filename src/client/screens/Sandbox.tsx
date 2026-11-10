@@ -37,7 +37,15 @@ function makeCard(rank: number, suit: Suit): Card {
 }
 
 function physicalCountFor(mode: DealingMode): number {
-  return mode === 'THREE_CARD' ? 3 : mode === 'TWO_CARD_ASSUMED' ? 2 : 1;
+  if (mode === 'THREE_CARD') return 3;
+  if (mode === 'FOUR_CARD_BEST_THREE') return 4;
+  if (mode === 'TWO_CARD_ASSUMED') return 2;
+  return 1;
+}
+
+/** Three-card and four-card modes compare physical cards only. */
+function isPhysicalOnly(mode: DealingMode): boolean {
+  return mode === 'THREE_CARD' || mode === 'FOUR_CARD_BEST_THREE';
 }
 
 let idCounter = 0;
@@ -88,7 +96,7 @@ export function Sandbox() {
         if (physical.length < physicalCount) {
           return { hand, result: null, error: 'Hand is incomplete for this dealing mode.', index: Number.POSITIVE_INFINITY };
         }
-        if (mode === 'THREE_CARD') {
+        if (isPhysicalOnly(mode)) {
           const result = evaluateHand(physical, ranking);
           return { hand, result, error: null, index: effectiveIndex(result, ranking, muflis) };
         }
@@ -192,7 +200,7 @@ export function Sandbox() {
       }
       defaults.push(candidate ?? emptyCard());
     }
-    setHands((list) => [...list, { id: nextId(), cards: mode === 'THREE_CARD' ? cards ?? defaults : defaults.slice(0, physicalCount), assumed: null }]);
+    setHands((list) => [...list, { id: nextId(), cards: isPhysicalOnly(mode) ? cards ?? defaults : defaults.slice(0, physicalCount), assumed: null }]);
     setManualOrder(null);
   }
 
@@ -349,6 +357,7 @@ export function Sandbox() {
               }}
             >
               <option value="THREE_CARD">Three-card</option>
+              <option value="FOUR_CARD_BEST_THREE">Four-card (best three of four)</option>
               <option value="TWO_CARD_ASSUMED">Two-card + assumed card</option>
               <option value="ONE_CARD_SHARED">One-card + shared open card</option>
             </select>

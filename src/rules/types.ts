@@ -1,11 +1,46 @@
 /** Shared rule-level types (no DOM, no server dependencies). */
 
-export type DealingMode = 'THREE_CARD' | 'TWO_CARD_ASSUMED' | 'ONE_CARD_SHARED';
+export type DealingMode = 'THREE_CARD' | 'FOUR_CARD_BEST_THREE' | 'TWO_CARD_ASSUMED' | 'ONE_CARD_SHARED';
 
 export const DEALING_MODE_LABEL: Record<DealingMode, string> = {
   THREE_CARD: 'Three-card',
+  FOUR_CARD_BEST_THREE: 'Four-card (best three of four)',
   TWO_CARD_ASSUMED: 'Two-card + assumed card',
   ONE_CARD_SHARED: 'One-card + shared open card',
+};
+
+/** True for modes played with a physical three-card hand and no assumed card. */
+export function isPhysicalOnlyMode(mode: DealingMode): boolean {
+  return mode === 'THREE_CARD' || mode === 'FOUR_CARD_BEST_THREE';
+}
+
+/** How many cards each player receives at the deal. */
+export function cardsPerPlayer(mode: DealingMode): number {
+  if (mode === 'THREE_CARD') return 3;
+  if (mode === 'FOUR_CARD_BEST_THREE') return 4;
+  if (mode === 'TWO_CARD_ASSUMED') return 2;
+  return 1;
+}
+
+/**
+ * Muflis is a **game type**, not a request. A Muflis game walks through these
+ * dealing stages in order, and only moves on when a round is actually **shown**.
+ */
+export const MULFIS_STAGE_ORDER: DealingMode[] = [
+  'FOUR_CARD_BEST_THREE',
+  'TWO_CARD_ASSUMED',
+  'ONE_CARD_SHARED',
+  'THREE_CARD',
+];
+
+/** The final Muflis stage is three-card with reversed (weakest-wins) ranking. */
+export const MULFIS_LAST_STAGE = MULFIS_STAGE_ORDER.length - 1;
+
+export type GameType = 'NORMAL' | 'MUFLIS';
+
+export const GAME_TYPE_LABEL: Record<GameType, string> = {
+  NORMAL: 'Normal Teen Patti',
+  MUFLIS: 'Muflis (staged, weakest hand wins at the end)',
 };
 
 /** Only meaningful in THREE_CARD mode. Never inferred silently. */

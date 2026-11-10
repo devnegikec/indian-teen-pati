@@ -6,6 +6,7 @@ import type { RankingProfile } from '../../rules/ranking';
 
 const MODES = [
   { value: 'THREE_CARD', label: 'Three cards (full hand or highest card)' },
+  { value: 'FOUR_CARD_BEST_THREE', label: 'Four cards (best three of four)' },
   { value: 'TWO_CARD_ASSUMED', label: 'Two cards + one assumed card' },
   { value: 'ONE_CARD_SHARED', label: 'One card + one shared open card' },
 ] as const;
@@ -23,9 +24,9 @@ export function Lobby({ initialCode }: { initialCode?: string }) {
     boot: 20,
     bootMode: 'FULL' as 'FULL' | 'ROUND',
     roundBootScope: 'FIRST_TO_ACT' as 'FIRST_TO_ACT' | 'EACH_TURN',
+    gameType: 'NORMAL' as RoomRules['gameType'],
     dealingMode: 'THREE_CARD' as RoomRules['dealingMode'],
     threeCardCompare: 'FULL_HAND' as RoomRules['threeCardCompare'],
-    muflisApproval: 'ADMIN' as RoomRules['muflisApproval'],
     counterMultiplier: 3,
     seenMultiple: 2,
     disputeWindowSeconds: 15,
@@ -58,9 +59,9 @@ export function Lobby({ initialCode }: { initialCode?: string }) {
             boot: form.boot,
             bootMode: form.bootMode,
             roundBootScope: form.roundBootScope,
+            gameType: form.gameType,
             dealingMode: form.dealingMode,
             threeCardCompare: form.threeCardCompare,
-            muflisApproval: form.muflisApproval,
             counterMultiplier: form.counterMultiplier,
             seenMultiple: form.seenMultiple,
             disputeWindowSeconds: form.disputeWindowSeconds,
@@ -198,9 +199,12 @@ export function Lobby({ initialCode }: { initialCode?: string }) {
           )}
 
           <label className="field field--wide">
-            <span>Dealing mode</span>
+            <span>
+              Dealing mode{form.gameType === 'MUFLIS' ? ' (Muflis games walk their own stages)' : ''}
+            </span>
             <select
               value={form.dealingMode}
+              disabled={form.gameType === 'MUFLIS'}
               onChange={(e) => setForm({ ...form, dealingMode: e.target.value as RoomRules['dealingMode'] })}
             >
               {MODES.map((m) => (
@@ -225,13 +229,13 @@ export function Lobby({ initialCode }: { initialCode?: string }) {
           )}
 
           <label className="field">
-            <span>Mid-round Muflis approval</span>
+            <span>Game</span>
             <select
-              value={form.muflisApproval}
-              onChange={(e) => setForm({ ...form, muflisApproval: e.target.value as RoomRules['muflisApproval'] })}
+              value={form.gameType}
+              onChange={(e) => setForm({ ...form, gameType: e.target.value as RoomRules['gameType'] })}
             >
-              <option value="ADMIN">Administrator only</option>
-              <option value="UNANIMOUS">Unanimous active players</option>
+              <option value="NORMAL">Normal Teen Patti</option>
+              <option value="MUFLIS">Muflis (four stages, weakest wins at the end)</option>
             </select>
           </label>
 

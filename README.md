@@ -8,7 +8,7 @@ It ships with:
 - Private rooms with invite links / room codes and an administrator.
 - A **configurable ranking engine** (not hard-coded Teen Patti rules) with a
   drag-and-drop editor and a test/ordering sandbox.
-- Normal and **Muflis** modes, including mid-round Muflis requests.
+- Normal games and **Muflis** games (a game type chosen when the room is created).
 - Three dealing modes: **three-card**, **two-card + assumed card**, and
   **one-card + shared open card**.
 - Full boot vs round boot, blind/seen stakes and counter (raise) rules.
@@ -226,15 +226,43 @@ Room rules (editable by the administrator, applied to **subsequent** rounds):
 | `boot` | 20 | Boot charged per round (clamped to ≥ `minBoot`) |
 | `bootMode` | `FULL` | `FULL` = every player pays the boot; `ROUND` = only the player on turn pays |
 | `roundBootScope` | `FIRST_TO_ACT` | With `ROUND`: only the first player to act, or each player on their first turn |
-| `dealingMode` | `THREE_CARD` | `THREE_CARD` / `TWO_CARD_ASSUMED` / `ONE_CARD_SHARED` |
+| `gameType` | `NORMAL` | `NORMAL` or `MUFLIS`. **Muflis is a game type, never a mid-round request.** |
+| `dealingMode` | `THREE_CARD` | `THREE_CARD` / `FOUR_CARD_BEST_THREE` / `TWO_CARD_ASSUMED` / `ONE_CARD_SHARED` (ignored in Muflis rooms) |
 | `threeCardCompare` | `FULL_HAND` | `FULL_HAND` or `HIGHEST_CARD` (never inferred) |
-| `muflisApproval` | `ADMIN` | `ADMIN` or `UNANIMOUS` (all active players) |
 | `counterMultiplier` | 3 | A counter pays level × this and raises the level to it |
 | `seenMultiple` | 2 | A seen player pays the blind price × this |
 | `disputeWindowSeconds` | 15 | Provisional-result window before auto settlement |
 | `remainderRule` | `LOWEST_SEAT` | Who gets an indivisible remainder on a split |
 | `maxBetsPerRound` | 24 | Safety valve: hands are opened at the cap (0 = off) |
 | `startingChips` | 5000 | Virtual chips on joining |
+
+### Muflis is a game, not a request
+
+`gameType` is fixed when the room is created: `NORMAL` or `MUFLIS`. There is no
+mid-round Muflis request and nothing to vote on.
+
+A Muflis game walks through four dealing **stages**, in this order:
+
+| Stage | Deal | Assumed card | Ranking |
+| --- | --- | --- | --- |
+| 1 | 4 cards each | none - you play the **best three of four** | normal |
+| 2 | 2 cards each | one assumed card, never higher than your best card | normal |
+| 3 | 1 card each + one shared open card | one assumed card, never higher than your best card **or** the open card | normal |
+| 4 | 3 cards each | none | **reversed** (the weakest hand wins) |
+
+A stage only moves on when a round is actually **shown**:
+
+- shown (a full show, a side show or the last player choosing to reveal) → the
+  game advances to the next stage; after stage 4 it returns to stage 1;
+- no show (everyone folded, or the last player took the pot without showing) →
+  the same stage repeats, so the reversed ranking keeps running in stage 4 exactly
+  as long as no show happens.
+
+The stage is stored on the room (`rooms.muflis_stage`) and copied into each round,
+so the table always shows `Muflis stage 2/4 — Two-card + assumed card`.
+
+The assumed-card limit in stages 2 and 3 is a plain rank comparison: equal to or
+lower than the highest rank in your hand (plus the shared open card in stage 3).
 
 ### Betting model
 
@@ -276,7 +304,7 @@ Worked example (boot 10, `seenMultiple = 2`, `counterMultiplier = 3`):
 ### Round state machine
 
 ```
-LOBBY → BOOT → DEALING → BETTING → (SHOW_REQUESTED | SIDE_SHOW_PENDING | MUFLIS_PENDING)
+LOBBY → BOOT → DEALING → BETTING → (SHOW_REQUESTED | SIDE_SHOW_PENDING)
                                     → (WINNER_CHOICE) → PROVISIONAL → (DISPUTE) → SETTLED
 ```
 
@@ -307,8 +335,10 @@ provisional-result window as any other result.
 
 ### Show rules
 
-- **Full show** — only allowed when **two players are left**. It ends the round:
-  both hands are compared and the winner takes the pot.
+- **Full show** — only allowed when **two players are left**, and only on your
+  **own turn**. A show request is **not free**: your normal bet is placed first
+  (the same amount you would chaal), then both hands are compared and the winner
+  takes the pot. Asking out of turn is refused (`BET_FIRST`).
 - **Side show** — allowed while **three or more** players remain, and only on
   your **own turn**: asking for a side show also places your normal bet, so a
   side show is never free. The request goes to the **immediately previous
@@ -466,8 +496,10 @@ or documented here.
 | Virtual cards never get a suit advantage | `tests/ranking.test.ts` |
 | AA / Ace-of-Spades and show-initiator rules | `tests/ranking.test.ts` |
 | A shared spade gives no exclusive advantage | `tests/ranking.test.ts` |
-| Unapproved Muflis does not change the game | `tests/game.test.ts` |
-| Muflis cannot be requested after the reveal | `tests/game.test.ts` |
+| Muflis is a game type (no request/vote actions exist) | `tests/game.test.ts` |
+| Muflis walks its four stages, only a show advances the stage | `tests/game.test.ts` |
+| Muflis final stage uses reversed ranking | `tests/game.test.ts`, `tests/ranking.test.ts` |
+| Four-card mode plays the best three of four | `tests/ranking.test.ts`, `tests/game.test.ts` |
 | Conflicts block settlement until resolved | `tests/game.test.ts` |
 | Reconnection keeps cards, turn state and balances | `tests/game.test.ts` |
 | Retried requests cannot settle twice | `tests/game.test.ts` |
