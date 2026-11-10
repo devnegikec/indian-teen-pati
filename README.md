@@ -230,7 +230,7 @@ Room rules (editable by the administrator, applied to **subsequent** rounds):
 | `threeCardCompare` | `FULL_HAND` | `FULL_HAND` or `HIGHEST_CARD` (never inferred) |
 | `muflisApproval` | `ADMIN` | `ADMIN` or `UNANIMOUS` (all active players) |
 | `counterMultiplier` | 3 | A counter pays level × this and raises the level to it |
-| `seenMultiple` | 2 | A seen player pays level × this |
+| `seenMultiple` | 2 | A seen player pays the blind price × this |
 | `disputeWindowSeconds` | 15 | Provisional-result window before auto settlement |
 | `remainderRule` | `LOWEST_SEAT` | Who gets an indivisible remainder on a split |
 | `maxBetsPerRound` | 24 | Safety valve: hands are opened at the cap (0 = off) |
@@ -238,43 +238,46 @@ Room rules (editable by the administrator, applied to **subsequent** rounds):
 
 ### Betting model
 
-The round tracks the **bet level** (what a blind player puts to pass), the
-**last bet** (what the previous player actually paid) and whether that player
-was **blind**.
+Two prices are tracked at all times:
+
+- **`stake`** — the *blind price*: what a player who has **not** seen their
+  cards puts in to stay in. It is also "the current bet".
+- **`seenStake`** — the *seen price*: what a player who **has** seen their
+  cards must put in. It is `stake × seenMultiple` (2) at the deal and after a
+  raise, and `stake × counterMultiplier` (3) after a counter.
 
 | Situation | Pays | Effect |
 | --- | --- | --- |
-| Blind player, previous bet was blind (or first bet) | `level` | a **blind pass** — you match, nothing changes |
-| Seen player | `level × seenMultiple` (2) — **double** | the level is unchanged, `lastBet` becomes that amount |
-| Blind player right after a **seen** bet | the **last bet amount** | it is a **counter**: from then on `level = counterAmount × 3` |
-| Explicit counter (any player) | at least your normal requirement | same tripling rule |
-| Raise | any amount above the requirement | becomes the new level |
+| Blind player (any time, including after a counter) | `stake` | a **blind pass** — you match the current bet, nothing changes |
+| Seen player | `seenStake` | the blind price becomes what you paid |
+| Blind player whose previous bet was made **seen** | `stake` | it counts as a **counter**: the *seen* price becomes `stake × 3`, the blind price is unchanged |
+| Explicit counter | your normal requirement | same tripling rule |
+| Raise | any amount above the requirement | becomes the new blind price |
 
-Counters and raises keep repeating, so the level keeps climbing.
+The key point: a counter is a blind bet that follows a **seen** bet. It raises
+the price only for players who have looked at their cards — a blind player
+after the counter simply passes with the same amount as before.
 
 Worked example (boot 10, `seenMultiple = 2`, `counterMultiplier = 3`):
 
-| Bet | Player | Pays | Level after | Seen plays now |
-| --- | --- | --- | --- | --- |
-| 1 | blind | 10 (pass) | 10 | 20 |
-| 2 | blind | 10 (pass) | 10 | 20 |
-| 3 | blind | 10 (pass) | 10 | 20 |
-| 4 | seen | 20 (double) | 20 | 20 |
-| 5 | blind → counter | 20 (the current bet) | **60** (3 × 20) | **60** — not 120 |
-| 6 | seen | 60 (match) | 60 | 60 |
-| 7 | seen | 60 (match) | 60 | 60 |
-| 8 | blind → counter | 60 | 180 | 180 |
-
-The doubling only applies while the betting is still blind. Once a seen bet (or a
-counter) has been made, everyone matches the level, so a counter is exactly ×3.
+| Bet | Player | Pays | Blind price after | Seen price after | Note |
+| --- | --- | --- | --- | --- | --- |
+| 1 | blind | 10 | 10 | 20 | blind pass |
+| 2 | blind | 10 | 10 | 20 | blind pass |
+| 3 | blind | 10 | 10 | 20 | blind pass |
+| 4 | seen | 20 | 20 | 20 | seen chaal |
+| 5 | blind | 20 | 20 | **60** | blind **counter** (3 × 20) |
+| 6 | blind | **20** | 20 | 60 | blind **pass** — *not* 60 |
+| 7 | seen | 60 | 60 | 60 | seen chaal |
+| 8 | blind | 60 | 60 | **180** | blind counter |
 
 `SEE_CARDS` does not consume the turn; `CHAAL`, `RAISE`, `COUNTER` and `FOLD` do.
 
 ### Round state machine
 
 ```
-LOBBY → BOOT → DEALING → BETTING → (SHOW_REQUESTED | MUFLIS_PENDING) →
-PROVISIONAL → (DISPUTE) → SETTLED   (VOID is reserved)
+LOBBY → BOOT → DEALING → BETTING → (SHOW_REQUESTED | SIDE_SHOW_PENDING | MUFLIS_PENDING)
+                                    → (WINNER_CHOICE) → PROVISIONAL → (DISPUTE) → SETTLED
 ```
 
 Every transition is persisted; actions that belong to another state are refused.
@@ -289,6 +292,18 @@ Your own cards are **not shown at the deal** — server-side, your view contains
 face-down placeholders until you press **See cards** (`SEE_CARDS`). That is what
 makes blind play real: `blind` only halves your stake, and you cannot choose an
 assumed card for a hand you have not looked at (`SEE_CARDS_FIRST`).
+
+### Last player standing
+
+When everyone else folds, the winner is **not** paid out immediately: the round
+enters `WINNER_CHOICE` and the winner picks
+
+- **Show my cards** — the hand (and its rank) is revealed to the whole table, or
+- **Take the pot** — the pot is awarded with no comparison and no cards shown.
+
+Nobody else can see the winner's cards while they decide. If they do nothing for
+30 seconds the pot is awarded without showing. The decision goes through the same
+provisional-result window as any other result.
 
 ### Show rules
 

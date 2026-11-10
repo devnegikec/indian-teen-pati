@@ -125,10 +125,12 @@ export interface RoundDoc {
   sharedCardId: string | null;
   players: RoundPlayerDoc[];
   pot: number;
-  /** Amount of the current bet (what a blind player must put). */
+  /** Amount a blind player puts (the last bet). */
   stake: number;
-  /** True when the previous bet was made by a player who had seen their cards. */
-  lastWasSeen: boolean;
+  /** Amount a seen player puts. */
+  seenPrice: number;
+  /** True when the previous bet was made by a seen player (a blind bet counters). */
+  counterNeeded: boolean;
   /** Who made the last bet — the side-show request goes to this player. */
   lastBettorUserId: string | null;
   turnSeat: number;
@@ -154,6 +156,8 @@ export interface RoundDoc {
     hands?: HandResultView[];
   } | null;
   result: RoundResultView | null;
+  /** The last player standing, while they decide to show or take the pot. */
+  survivorUserId: string | null;
   provisionalUntil: number | null;
   dispute: DisputeDoc | null;
   log: Array<{ at: string; text: string }>;
@@ -171,6 +175,7 @@ const ACTIVE_ROUND_STATES: RoundState[] = [
   'SHOW_REQUESTED',
   'SIDE_SHOW_PENDING',
   'MUFLIS_PENDING',
+  'WINNER_CHOICE',
   'PROVISIONAL',
   'DISPUTE',
 ];
@@ -193,6 +198,7 @@ function isUniqueViolation(error: unknown): boolean {
 export class GameService {
   private rankingCache = new Map<string, ResolvedRanking>();
   private timers = new Map<string, NodeJS.Timeout>();
+  private winnerTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(private db: DB, private broadcast: (roomId: string) => void) {
     this.seedProfiles();
@@ -205,10 +211,39 @@ export class GameService {
    * that a deploy cannot leave chips stuck in a provisional pot.
    */
   private recoverPendingRounds(): void {
-    const rows = this.db.prepare("SELECT * FROM rounds WHERE state = 'PROVISIONAL'").all() as RoundRow[];
+    // Rounds created by an older copy of the rules carry a different betting
+    // document, which would produce nonsense amounts mid-hand. Refund them and
+    // let the table start a clean round.
+    const stale = this.db.prepare("SELECT * FROM rounds WHERE state NOT IN ('SETTLED','VOID')").all() as RoundRow[];
+    for (const row of stale) {
+      try {
+        const doc = this.loadDoc(row);
+        if (doc.seenPrice !== undefined) continue;
+        const run = this.db.transaction(() => {
+          for (const p of doc.players) {
+            if (p.totalBet > 0) this.addChips(doc, p.userId, p.totalBet, 'REFUND');
+            p.totalBet = 0;
+          }
+          doc.pot = 0;
+          doc.state = 'VOID';
+          doc.settledAt = nowIso();
+          this.log(doc, 'Round refunded: it was dealt under an older version of the betting rules.');
+          this.saveDoc(doc);
+        });
+        run();
+      } catch {
+        /* keep starting up */
+      }
+    }
+
+    const rows = this.db.prepare("SELECT * FROM rounds WHERE state IN ('PROVISIONAL','WINNER_CHOICE')").all() as RoundRow[];
     for (const row of rows) {
       try {
         const doc = this.loadDoc(row);
+        if (doc.state === 'WINNER_CHOICE') {
+          this.scheduleWinnerChoice(doc.roomId, 30);
+          continue;
+        }
         if (doc.dispute && doc.dispute.status === 'OPEN') continue;
         const remaining = (doc.provisionalUntil ?? 0) - Date.now();
         if (remaining > 0) {
@@ -431,7 +466,7 @@ export class GameService {
 
   private toBetting(doc: RoundDoc): BettingState {
     const config: BettingConfig = {
-      level: doc.stake,
+      boot: doc.rules.boot,
       seenMultiple: doc.rules.seenMultiple ?? 2,
       counterMultiplier: doc.rules.counterMultiplier ?? 3,
     };
@@ -446,15 +481,17 @@ export class GameService {
       hasActed: p.hasActed,
     }));
     const state = createBettingState(players, config, doc.turnSeat, doc.pot);
-    state.level = doc.stake;
-    state.lastWasSeen = doc.lastWasSeen ?? false;
+    state.blindPrice = doc.stake;
+    state.seenPrice = doc.seenPrice ?? doc.stake * (doc.rules.seenMultiple ?? 2);
+    state.counterNeeded = doc.counterNeeded ?? false;
     state.betsMade = doc.betsMade;
     state.counterCount = doc.counterCount;
     return state;
   }
   private fromBetting(doc: RoundDoc, state: BettingState): void {
-    doc.stake = state.level;
-    doc.lastWasSeen = state.lastWasSeen;
+    doc.stake = state.blindPrice;
+    doc.seenPrice = state.seenPrice;
+    doc.counterNeeded = state.counterNeeded;
     doc.pot = state.pot;
     doc.turnSeat = state.turnSeat;
     doc.betsMade = state.betsMade;
@@ -572,6 +609,9 @@ export class GameService {
       case 'RAISE_CONFLICT':
         this.raiseConflict(room, userId, String(payload.reason ?? ''));
         return;
+      case 'WINNER_ACTION':
+        this.chooseWinner(room, userId, payload.show === true);
+        return;
       case 'RESOLVE_CONFLICT':
         this.requireAdmin(room, userId);
         this.resolveConflict(room, userId, payload);
@@ -638,7 +678,8 @@ export class GameService {
       }),
       pot: 0,
       stake: rules.boot,
-      lastWasSeen: false,
+      seenPrice: rules.boot * rules.seenMultiple,
+      counterNeeded: false,
       lastBettorUserId: null,
       turnSeat: firstToAct,
       betsMade: 0,
@@ -648,6 +689,7 @@ export class GameService {
       show: null,
       sideShow: null,
       result: null,
+      survivorUserId: null,
       provisionalUntil: null,
       dispute: null,
       log: [],
@@ -679,6 +721,8 @@ export class GameService {
     this.deal(doc);
     doc.state = 'BETTING';
     doc.stake = rules.boot;
+    doc.seenPrice = rules.boot * rules.seenMultiple;
+    doc.counterNeeded = false;
     this.log(
       doc,
       `${rules.dealingMode === 'THREE_CARD' ? 'Three cards' : rules.dealingMode === 'TWO_CARD_ASSUMED' ? 'Two cards + assumed card' : 'One card + shared card'} dealt. Blind ${rules.boot}, seen chaal ${rules.boot * rules.seenMultiple}. ${doc.players.find((p) => p.seat === doc.turnSeat)?.name} to act.`,
@@ -1110,31 +1154,82 @@ export class GameService {
     this.scheduleSettlement(doc.roomId, doc.rules.disputeWindowSeconds);
   }
 
+  /**
+   * Everyone else folded. The winner now chooses whether to show their cards to
+   * the table or simply take the pot without a comparison.
+   */
   private resolveLastPlayer(doc: RoundDoc, survivor: RoundPlayerDoc): void {
-    const ranking = this.resolvedFor(doc.rankingProfile);
-    const hands: HandResultView[] = doc.players.map((p) => ({
-      userId: p.userId,
-      name: p.name,
-      cards: this.cardViews(p),
-      assumedRank: p.assumedRank,
-      label: p.folded ? 'Folded' : p.userId === survivor.userId ? this.safeLabel(doc, p, ranking) : 'Folded',
-      folded: p.folded,
-    }));
+    doc.state = 'WINNER_CHOICE';
+    doc.survivorUserId = survivor.userId;
+    doc.result = null;
+    this.log(
+      doc,
+      `${survivor.name} takes the pot — waiting for them to show their cards or take it without showing.`,
+    );
+    this.saveDoc(doc);
+    this.scheduleWinnerChoice(doc.roomId, 30);
+  }
+
+  private scheduleWinnerChoice(roomId: string, seconds: number): void {
+    const existing = this.winnerTimers.get(roomId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.winnerTimers.delete(roomId);
+      try {
+        const row = this.latestRoundRow(roomId);
+        if (!row) return;
+        const doc = this.loadDoc(row);
+        if (doc.state !== 'WINNER_CHOICE') return;
+        this.finishWinnerChoice(doc, false);
+        this.broadcast(roomId);
+      } catch {
+        /* ignore */
+      }
+    }, Math.max(1, seconds) * 1000);
+    timer.unref?.();
+    this.winnerTimers.set(roomId, timer);
+  }
+
+  private chooseWinner(room: RoomRow, userId: string, show: boolean): void {
+    const doc = this.currentDoc(room.id, ['WINNER_CHOICE']);
+    if (doc.survivorUserId !== userId) throw new AppError('Only the winner can decide.', 'NOT_WINNER');
+    this.finishWinnerChoice(doc, show);
+  }
+
+  private finishWinnerChoice(doc: RoundDoc, show: boolean): void {
+    const survivor = doc.players.find((p) => p.userId === doc.survivorUserId);
+    if (!survivor) throw new AppError('The winner is no longer in the round.', 'NO_WINNER');
+    const hands: HandResultView[] = [];
+    if (show) {
+      const ranking = this.resolvedFor(doc.rankingProfile);
+      const hand = this.buildHand(doc, survivor, ranking);
+      hands.push({
+        userId: survivor.userId,
+        name: survivor.name,
+        cards: this.cardViews(survivor),
+        assumedRank: survivor.assumedRank,
+        label: hand.label,
+        folded: false,
+      });
+    }
     doc.result = {
       kind: 'LAST_PLAYER',
       winnerUserId: survivor.userId,
       winnerName: survivor.name,
       split: false,
       amounts: {},
-      reason: `Everyone else folded, so ${survivor.name} wins the pot.`,
+      reason: show
+        ? `Everyone else folded; ${survivor.name} showed their cards and wins the pot.`
+        : `Everyone else folded, so ${survivor.name} wins the pot without showing.`,
       steps: ['All other players folded.'],
       hands,
       decidedBy: null,
       explanation: null,
     };
+    doc.survivorUserId = null;
     doc.state = 'PROVISIONAL';
     doc.provisionalUntil = Date.now() + doc.rules.disputeWindowSeconds * 1000;
-    this.log(doc, `${survivor.name} wins as the last player standing.`);
+    this.log(doc, doc.result.reason);
     this.saveDoc(doc);
     this.scheduleSettlement(doc.roomId, doc.rules.disputeWindowSeconds);
   }
@@ -1530,10 +1625,12 @@ export class GameService {
         state: doc.state,
         pot: doc.pot,
         stake: doc.stake,
-        seenStake: doc.lastWasSeen ? doc.stake : doc.stake * (doc.rules.seenMultiple ?? 2),
+        seenStake: doc.seenPrice ?? doc.stake * (doc.rules.seenMultiple ?? 2),
         lastBet: doc.stake,
         lastBettorUserId: doc.lastBettorUserId ?? null,
         lastBettorName: doc.lastBettorUserId ? (doc.players.find((p) => p.userId === doc.lastBettorUserId)?.name ?? null) : null,
+        survivorUserId: doc.survivorUserId ?? null,
+        survivorName: doc.survivorUserId ? (doc.players.find((p) => p.userId === doc.survivorUserId)?.name ?? null) : null,
         turnSeat: doc.state === 'BETTING' ? doc.turnSeat : null,
         muflis: doc.muflis,
         dealingMode: doc.rules.dealingMode,

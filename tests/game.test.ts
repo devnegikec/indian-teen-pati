@@ -79,9 +79,20 @@ describe('round start, boot and chip integrity', () => {
     // seat 1 starts; fold both non-dealer seats
     ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'FOLD', {});
     ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'FOLD', {});
-    const v = view(ctx, ctx.admin);
+    let v = view(ctx, ctx.admin);
+    // the winner first decides whether to show
+    expect(v.round?.state).toBe('WINNER_CHOICE');
+    expect(v.round?.survivorUserId).toBe(ctx.admin.userId);
+    expect(v.round?.result).toBeNull();
+    // nobody else sees the winner's cards yet
+    expect(view(ctx, ctx.bob).players.find((p) => p.userId === ctx.admin.userId)!.cards.every((c) => c.hidden)).toBe(
+      true,
+    );
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'WINNER_ACTION', { show: false });
+    v = view(ctx, ctx.admin);
     expect(v.round?.state).toBe('PROVISIONAL');
     expect(v.round?.result?.winnerUserId).toBe(ctx.admin.userId);
+    expect(v.round?.result?.hands.length).toBe(0); // took the pot without showing
     ctx.game.settleRound(ctx.roomId, true);
     const settled = view(ctx, ctx.admin);
     expect(settled.round?.state).toBe('SETTLED');
@@ -90,11 +101,26 @@ describe('round start, boot and chip integrity', () => {
     expect(adminChips).toBe(1020); // 1000 - 10 boot + 30 pot
   });
 
+  it('lets the last player show their cards before taking the pot', () => {
+    const ctx = setup();
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
+    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'FOLD', {});
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'FOLD', {});
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'WINNER_ACTION', { show: true });
+    const v = view(ctx, ctx.admin);
+    expect(v.round?.result?.hands.length).toBe(1);
+    expect(v.round?.result?.hands[0].cards.length).toBe(3);
+    expect(v.round?.result?.reason).toMatch(/showed their cards/i);
+    // only the winner may answer
+    expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'WINNER_ACTION', { show: false })).toThrow();
+  });
+
   it('cannot settle twice', () => {
     const ctx = setup();
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
     ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'FOLD', {});
     ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'FOLD', {});
+    ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'WINNER_ACTION', { show: false });
     ctx.game.settleRound(ctx.roomId, true);
     const afterFirst = totalChips(ctx);
     ctx.game.settleRound(ctx.roomId, true);
@@ -130,9 +156,13 @@ describe('betting rules', () => {
     expect(bobAgain?.chaal.amount).toBe(20);
     ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {});
 
-    // level is exactly 3 × the counter amount (60), not 6 ×
-    expect(view(ctx, ctx.admin).round?.stake).toBe(60);
+    // the seen price is exactly 3 × the counter amount (60), not 6 ×
     expect(view(ctx, ctx.admin).round?.seenStake).toBe(60);
+
+    // ...but a blind player after a counter just passes with the same amount
+    const caraBlind = view(ctx, ctx.cara).players.find((p) => p.userId === ctx.cara.userId)!.legal;
+    expect(caraBlind?.chaal.kind).toBe('BLIND');
+    expect(caraBlind?.chaal.amount).toBe(20);
 
     // bet 5: a SEEN player now pays 60 (previously this wrongly paid 120)
     ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'SEE_CARDS', {});
@@ -152,8 +182,8 @@ describe('betting rules', () => {
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
     expect(() => ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'COUNTER', {})).toThrow(/after a player has bet/i);
     ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {}); // blind pass at 10
-    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'COUNTER', {}); // pays 10, level -> 30
-    expect(view(ctx, ctx.admin).round?.stake).toBe(30);
+    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'COUNTER', {}); // pays 10, seen price -> 30
+    expect(view(ctx, ctx.admin).round?.seenStake).toBe(30);
   });
 
   it('rejects actions from players who are not on turn', () => {

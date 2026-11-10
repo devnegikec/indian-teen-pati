@@ -181,6 +181,9 @@ export interface RoundView {
   /** The player who made the last bet — a side show is offered to them. */
   lastBettorUserId: string | null;
   lastBettorName: string | null;
+  /** Set while the last standing player decides whether to show their cards. */
+  survivorUserId: string | null;
+  survivorName: string | null;
   turnSeat: number | null;
   muflis: boolean;
   dealingMode: DealingMode;

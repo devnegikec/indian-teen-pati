@@ -459,6 +459,27 @@ export function Table({ roomId }: { roomId: string }) {
               </button>
             )}
 
+            {round?.state === 'WINNER_CHOICE' && (
+              <div className="actions">
+                <p className="small">
+                  Everyone else folded. {round.survivorName} takes the pot — show your cards or take it without a
+                  comparison.
+                </p>
+                {me?.userId === round.survivorUserId ? (
+                  <div className="actions__row">
+                    <button className="btn btn--primary" onClick={() => send('WINNER_ACTION', { show: true })}>
+                      Show my cards
+                    </button>
+                    <button className="btn" onClick={() => send('WINNER_ACTION', { show: false })}>
+                      Take the pot (don't show)
+                    </button>
+                  </div>
+                ) : (
+                  <p className="muted small">Waiting for {round.survivorName} to show or take the pot.</p>
+                )}
+              </div>
+            )}
+
             {round?.state === 'PROVISIONAL' && (
               <div className="actions">
                 <p className="small">

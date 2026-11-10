@@ -33,6 +33,7 @@ export type RoundState =
   | 'SHOW_REQUESTED'
   | 'SIDE_SHOW_PENDING'
   | 'MUFLIS_PENDING'
+  | 'WINNER_CHOICE'
   | 'PROVISIONAL'
   | 'DISPUTE'
   | 'SETTLED'
@@ -46,6 +47,7 @@ export const ROUND_STATE_LABEL: Record<RoundState, string> = {
   SHOW_REQUESTED: 'Show requested',
   SIDE_SHOW_PENDING: 'Side show requested',
   MUFLIS_PENDING: 'Muflis request pending',
+  WINNER_CHOICE: 'Winner deciding',
   PROVISIONAL: 'Provisional result',
   DISPUTE: 'Dispute',
   SETTLED: 'Settled',

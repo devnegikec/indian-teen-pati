@@ -1,20 +1,23 @@
 /**
  * Betting engine.
  *
- * One number carries the table: `level`, the amount of the current bet.
+ * Two prices live side by side:
  *
- *   - A **blind** player always matches the level (a "pass").
- *     If the previous bet was made by a *seen* player, that match is a
- *     **counter**: the level is then multiplied by `counterMultiplier`
- *     (three times) and everybody after plays at the new level.
- *   - A **seen** player pays **double** the level — but only while the betting
- *     has been blind. Once a seen bet (or a counter) has been made, seen players
- *     simply match the level, so a counter is exactly ×3 and never ×6.
- *   - A **raise** sets the level to any amount above the requirement.
+ *   - `blindPrice` — what a **blind** player puts. A blind player always pays
+ *     exactly what the previous player paid (the "pass"). After the first blind
+ *     bet it stays at that amount until somebody raises or counters.
+ *   - `seenPrice` — what a **seen** player puts: double the blind price.
  *
- * Worked example (boot 10): blind 10 → blind 10 → blind 10 → seen 20 →
- * blind counter 20 (level 60) → seen 60 → seen 60 → blind counter 60
- * (level 180) …
+ * A blind player's bet is a **counter** only when the previous bet was made by a
+ * *seen* player ("it came after the seen bet"). A counter raises the seen price
+ * to three times the counter amount. A blind player who comes *after* a counter
+ * is not forced to pay the tripled price — they simply pass with the same
+ * amount again.
+ *
+ * Sequence from the house rules (boot 10):
+ *   Dev blind 10 → Yet blind 10 → Hem blind 10 → Dev seen 20 →
+ *   Yet blind counter 20 (seen price 60) → Hem blind pass 20 →
+ *   Dev seen 60 → blind counter 60 (seen price 180) → …
  */
 
 export interface BetPlayer {
@@ -29,19 +32,21 @@ export interface BetPlayer {
 }
 
 export interface BettingConfig {
-  /** Starting level (normally the boot). */
-  level: number;
-  /** A seen player pays level × this while the betting is still blind. */
+  /** Boot — the opening blind price. */
+  boot: number;
+  /** A seen player pays blindPrice × this (2 = double). */
   seenMultiple: number;
-  /** A counter multiplies the level by this. */
+  /** A counter raises the seen price to counterAmount × this. */
   counterMultiplier: number;
 }
 
 export interface BettingState {
-  /** Amount of the current bet (what a blind player must put). */
-  level: number;
-  /** True when the previous bet was made by a player who had seen their cards. */
-  lastWasSeen: boolean;
+  /** Amount a blind player puts (matches the previous bet). */
+  blindPrice: number;
+  /** Amount a seen player puts. */
+  seenPrice: number;
+  /** True when the previous bet was made by a seen player (so a blind bet counters). */
+  counterNeeded: boolean;
   seenMultiple: number;
   counterMultiplier: number;
   pot: number;
@@ -102,16 +107,14 @@ export function playerById(state: BettingState, userId: string): BetPlayer | und
 
 export function chaalKind(state: BettingState, player: BetPlayer): ChaalKind {
   if (!player.blind) return 'SEEN';
-  return state.lastWasSeen ? 'BLIND_COUNTER' : 'BLIND';
+  return state.counterNeeded ? 'BLIND_COUNTER' : 'BLIND';
 }
 
 /** What this player must put to stay in the hand. */
 export function requiredAmount(state: BettingState, player: BetPlayer): number {
-  if (player.blind) return state.level;
-  return state.lastWasSeen ? state.level : state.level * state.seenMultiple;
+  return player.blind ? state.blindPrice : state.seenPrice;
 }
 
-/** Cost of an explicit counter — the same amount the player would normally put. */
 export function counterCost(state: BettingState, player: BetPlayer): number {
   return requiredAmount(state, player);
 }
@@ -133,7 +136,7 @@ export function legalActions(state: BettingState, userId: string): LegalActions 
   return {
     canSeeCards: player.blind,
     chaal: { amount: need, allowed: player.chips >= need, kind: chaalKind(state, player) },
-    seenAmount: state.lastWasSeen ? state.level : state.level * state.seenMultiple,
+    seenAmount: state.seenPrice,
     raise: {
       min: need + 1,
       max: player.chips,
@@ -198,7 +201,7 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       next.lastAction = 'see';
       return {
         state: next,
-        event: { userId, type: 'SEE_CARDS', amount: 0, levelAfter: next.level, potAfter: next.pot, note: 'Looked at cards' },
+        event: { userId, type: 'SEE_CARDS', amount: 0, levelAfter: next.seenPrice, potAfter: next.pot, note: 'Looked at cards' },
       };
     }
     case 'CHAAL': {
@@ -206,27 +209,28 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       next.betsMade++;
       let note: string;
       if (kind === 'SEEN') {
-        next.level = need; // double of the blind level, or a plain match
-        next.lastWasSeen = true;
+        // the seen bet becomes the new blind price
+        next.blindPrice = need;
+        next.counterNeeded = true;
         next.lastAction = 'chaal';
         note = `Chaal ${need}`;
       } else if (kind === 'BLIND_COUNTER') {
-        // blind bet right after a seen bet: counter, level × 3 exactly once
+        // blind bet right after a seen bet -> counter
         next.counterCount++;
-        next.level = counterLevel(next, need);
-        next.lastWasSeen = true;
+        next.seenPrice = counterLevel(next, need);
+        next.counterNeeded = false;
         next.lastAction = 'counter';
-        note = `Blind counter ${need} (bet raised to ${next.level})`;
+        note = `Blind counter ${need} (seen play now ${next.seenPrice})`;
       } else {
-        // blind pass: match the level
-        next.lastWasSeen = false;
+        // plain pass: match the previous bet
+        next.counterNeeded = false;
         next.lastAction = 'blind';
         note = `Blind ${need}`;
       }
       finishTurn(next, player);
       return {
         state: next,
-        event: { userId, type: 'CHAAL', amount: need, levelAfter: next.level, potAfter: next.pot, note },
+        event: { userId, type: 'CHAAL', amount: need, levelAfter: next.seenPrice, potAfter: next.pot, note },
       };
     }
     case 'RAISE': {
@@ -239,13 +243,14 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       }
       pay(next, player, amount);
       next.betsMade++;
-      next.level = amount;
-      next.lastWasSeen = !player.blind;
+      next.blindPrice = amount;
+      next.seenPrice = player.blind ? amount * next.seenMultiple : amount;
+      next.counterNeeded = !player.blind;
       next.lastAction = 'raise';
       finishTurn(next, player);
       return {
         state: next,
-        event: { userId, type: 'RAISE', amount, levelAfter: next.level, potAfter: next.pot, note: `Raise to ${amount}` },
+        event: { userId, type: 'RAISE', amount, levelAfter: next.seenPrice, potAfter: next.pot, note: `Raise to ${amount}` },
       };
     }
     case 'COUNTER': {
@@ -256,8 +261,8 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       pay(next, player, cost);
       next.betsMade++;
       next.counterCount++;
-      next.level = counterLevel(next, cost);
-      next.lastWasSeen = true;
+      next.seenPrice = counterLevel(next, cost);
+      next.counterNeeded = false;
       next.lastAction = 'counter';
       finishTurn(next, player);
       return {
@@ -266,9 +271,9 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
           userId,
           type: 'COUNTER',
           amount: cost,
-          levelAfter: next.level,
+          levelAfter: next.seenPrice,
           potAfter: next.pot,
-          note: `Counter ${cost} (bet raised to ${next.level})`,
+          note: `Counter ${cost} (seen play now ${next.seenPrice})`,
         },
       };
     }
@@ -278,7 +283,7 @@ export function applyBet(state: BettingState, userId: string, action: BetAction)
       finishTurn(next, player);
       return {
         state: next,
-        event: { userId, type: 'FOLD', amount: 0, levelAfter: next.level, potAfter: next.pot, note: 'Folded' },
+        event: { userId, type: 'FOLD', amount: 0, levelAfter: next.seenPrice, potAfter: next.pot, note: 'Folded' },
       };
     }
     default:
@@ -294,8 +299,9 @@ export function createBettingState(
 ): BettingState {
   const activeCount = players.filter((p) => p.inRound && !p.folded).length;
   return {
-    level: config.level,
-    lastWasSeen: false,
+    blindPrice: config.boot,
+    seenPrice: config.boot * config.seenMultiple,
+    counterNeeded: false,
     seenMultiple: config.seenMultiple,
     counterMultiplier: config.counterMultiplier,
     pot,
