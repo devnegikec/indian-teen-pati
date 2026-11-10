@@ -309,10 +309,14 @@ provisional-result window as any other result.
 
 - **Full show** — only allowed when **two players are left**. It ends the round:
   both hands are compared and the winner takes the pot.
-- **Side show** — allowed while **three or more** players remain. The initiator
-  picks an opponent, betting pauses (`SIDE_SHOW_PENDING`), and the opponent
+- **Side show** — allowed while **three or more** players remain, and only on
+  your **own turn**: asking for a side show also places your normal bet, so a
+  side show is never free. The request goes to the **immediately previous
+  player** at the table, and that neighbour must have **seen their cards** — if
+  the player before you is still blind, the request is refused
+  (`PREV_BLIND`). Betting then pauses (`SIDE_SHOW_PENDING`) and the neighbour
   accepts or declines:
-  - decline → betting resumes, nobody folds;
+  - decline → betting resumes at once with the next player's turn, nobody folds;
   - accept → the two hands are compared privately, the weaker hand folds, both
     players are treated as having seen their cards, and the round continues;
   - a tie folds nobody.

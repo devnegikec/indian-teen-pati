@@ -880,6 +880,51 @@ export class GameService {
   /* Side show (3+ players)                                           */
   /* ---------------------------------------------------------------- */
 
+  /** The nearest seat playing before `userId`, wrapping around the table. */
+  private previousActivePlayer(doc: RoundDoc, userId: string): RoundDoc['players'][number] | null {
+    const active = doc.players
+      .filter((p) => p.inRound && !p.folded)
+      .sort((a, b) => a.seat - b.seat);
+    const me = active.find((p) => p.userId === userId);
+    if (!me || active.length < 2) return null;
+    const before = active.filter((p) => p.seat < me.seat);
+    return before.length ? before[before.length - 1] : active[active.length - 1];
+  }
+
+  /**
+   * Who *this viewer* would ask for a side show, and whether they may ask.
+   * A side show goes to the immediately preceding player at the table, and that
+   * player must have seen their cards.
+   */
+  private sideShowInfo(doc: RoundDoc, viewerId: string): {
+    targetUserId: string | null;
+    targetName: string | null;
+    allowed: boolean;
+    reason: string | null;
+  } {
+    const none = { targetUserId: null, targetName: null, allowed: false, reason: null as string | null };
+    if (doc.state !== 'BETTING') return none;
+    const active = doc.players.filter((p) => p.inRound && !p.folded);
+    if (active.length < 3) return none;
+    const me = active.find((p) => p.userId === viewerId);
+    if (!me) return none;
+    const prev = this.previousActivePlayer(doc, viewerId);
+    if (!prev) return none;
+    const base = { targetUserId: prev.userId, targetName: prev.name, allowed: false, reason: null as string | null };
+    if (doc.sideShow && doc.sideShow.status === 'PENDING') {
+      return { ...base, reason: 'A side show request is already pending.' };
+    }
+    const onTurn = doc.players.find((p) => p.seat === doc.turnSeat);
+    if (!onTurn || onTurn.userId !== viewerId) {
+      return { ...base, reason: 'You can only ask for a side show on your own turn.' };
+    }
+    if (me.blind) return { ...base, reason: 'See your cards before asking for a side show.' };
+    if (prev.blind) {
+      return { ...base, reason: `${prev.name} has not seen their cards, so a side show is not allowed.` };
+    }
+    return { ...base, allowed: true };
+  }
+
   private requestSideShow(doc: RoundDoc, userId: string): void {
     if (doc.state !== 'BETTING') throw new AppError('A side show can only be requested while betting.', 'BAD_STATE');
     const active = doc.players.filter((p) => p.inRound && !p.folded);
@@ -889,20 +934,56 @@ export class GameService {
     const player = active.find((p) => p.userId === userId);
     if (!player) throw new AppError('Only active players can request a side show.', 'NOT_ACTIVE');
 
-    // A side show always goes to the player who made the last bet.
-    const targetId = doc.lastBettorUserId;
-    if (!targetId) throw new AppError('Nobody has bet yet, so there is nobody to show against.', 'NO_LAST_BETTOR');
-    const target = active.find((p) => p.userId === targetId);
-    if (!target) throw new AppError('The player who made the last bet has folded.', 'NO_LAST_BETTOR');
-    if (target.userId === userId) {
-      throw new AppError('You made the last bet, so somebody else has to ask you.', 'BAD_TARGET');
+    // 1. a side show is never free: you must bet on your own turn first.
+    const onTurn = doc.players.find((p) => p.seat === doc.turnSeat);
+    if (!onTurn || onTurn.userId !== userId) {
+      throw new AppError(
+        'Ask for a side show on your own turn — the request also places your bet.',
+        'BET_FIRST',
+      );
+    }
+    if (player.blind) {
+      throw new AppError('Press "See cards" before asking for a side show.', 'SEE_CARDS_FIRST');
+    }
+
+    // 2. the request goes to the immediately preceding player, who must have
+    //    seen their cards. A blind neighbour cannot be asked.
+    const target = this.previousActivePlayer(doc, userId);
+    if (!target) throw new AppError('There is nobody to show against.', 'NO_PREVIOUS_PLAYER');
+    if (target.blind) {
+      throw new AppError(
+        `${target.name} has not seen their cards, so you cannot ask them for a side show.`,
+        'PREV_BLIND',
+      );
     }
     if (doc.sideShow && doc.sideShow.status === 'PENDING') {
       throw new AppError('A side show request is already pending.', 'SIDE_SHOW_PENDING');
     }
-    doc.sideShow = { initiator: userId, target: targetId, at: nowIso(), status: 'PENDING' };
+
+    // Place the requester's bet first, then park the request.
+    const state = this.toBetting(doc);
+    const { state: after, event } = applyBet(state, userId, { type: 'CHAAL' });
+    this.fromBetting(doc, after);
+    doc.lastBettorUserId = userId;
+    this.log(doc, `${player.name}: ${event.note}. Pot ${doc.pot}.`);
+    if (after.roundOver) {
+      const alive = doc.players.filter((p) => p.inRound && !p.folded);
+      this.resolveLastPlayer(doc, alive[0]);
+      this.saveDoc(doc);
+      return;
+    }
+    if (doc.rules.maxBetsPerRound > 0 && doc.betsMade >= doc.rules.maxBetsPerRound) {
+      this.resolveCapShowdown(doc);
+      this.saveDoc(doc);
+      return;
+    }
+
+    doc.sideShow = { initiator: userId, target: target.userId, at: nowIso(), status: 'PENDING' };
     doc.state = 'SIDE_SHOW_PENDING';
-    this.log(doc, `${player.name} requested a side show with ${target.name}. Betting is paused until they answer.`);
+    this.log(
+      doc,
+      `${player.name} bet ${event.amount} and asked ${target.name} for a side show. Betting is paused until they answer.`,
+    );
     this.saveDoc(doc);
   }
 
@@ -925,7 +1006,17 @@ export class GameService {
     if (!accept) {
       request.status = 'DECLINED';
       doc.state = 'BETTING';
-      this.log(doc, `${b.name} declined the side show. Betting resumes.`);
+      // 3. a refusal never blocks the game: the turn moves on to the next player.
+      const alive = doc.players.filter((p) => p.inRound && !p.folded);
+      const onTurn = doc.players.find((p) => p.seat === doc.turnSeat);
+      if (!onTurn || onTurn.folded || !onTurn.inRound) {
+        doc.turnSeat = nextSeatAfter(doc.turnSeat, alive.map((p) => p.seat));
+      }
+      const nextUp = doc.players.find((p) => p.seat === doc.turnSeat);
+      this.log(
+        doc,
+        `${b.name} declined the side show. Betting resumes${nextUp ? ` — ${nextUp.name} to act` : ''}.`,
+      );
       this.saveDoc(doc);
       return;
     }
@@ -1501,6 +1592,10 @@ export class GameService {
     const revealed = !!doc && REVEAL_STATES.includes(doc.state);
     const viewerIsAdmin = room.admin_id === viewerId;
     const adminSeesAll = viewerIsAdmin && !!doc && doc.state === 'DISPUTE';
+    // Who this viewer may ask for a side show right now (previous seen player).
+    const sideShowInfo = doc
+      ? this.sideShowInfo(doc, viewerId)
+      : { targetUserId: null, targetName: null, allowed: false, reason: null };
     // A side show reveals cards only once the invited player has accepted.
     const sideShowPair =
       doc?.sideShow &&
@@ -1629,6 +1724,10 @@ export class GameService {
         lastBet: doc.stake,
         lastBettorUserId: doc.lastBettorUserId ?? null,
         lastBettorName: doc.lastBettorUserId ? (doc.players.find((p) => p.userId === doc.lastBettorUserId)?.name ?? null) : null,
+        sideShowTargetUserId: sideShowInfo.targetUserId,
+        sideShowTargetName: sideShowInfo.targetName,
+        sideShowAllowed: sideShowInfo.allowed,
+        sideShowBlockedReason: sideShowInfo.reason,
         survivorUserId: doc.survivorUserId ?? null,
         survivorName: doc.survivorUserId ? (doc.players.find((p) => p.userId === doc.survivorUserId)?.name ?? null) : null,
         turnSeat: doc.state === 'BETTING' ? doc.turnSeat : null,

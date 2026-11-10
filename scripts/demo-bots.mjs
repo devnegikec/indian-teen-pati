@@ -132,7 +132,11 @@ for (const bot of bots) {
           return;
         }
         if (blind) blindCounts.set(bot.userId, (blindCounts.get(bot.userId) ?? 0) + 1);
-        if (Math.random() < 0.18 && me.legal.raise.allowed) {
+        // occasionally ask the player before us for a side show (this also
+        // places the bot's bet, so it replaces the chaal)
+        if (!blind && round.sideShowAllowed && Math.random() < 0.12) {
+          act(socket, roomId, 'SIDE_SHOW');
+        } else if (Math.random() < 0.18 && me.legal.raise.allowed) {
           act(socket, roomId, 'RAISE', { amount: me.legal.chaal.amount * 2 });
         } else if (me.chips >= me.legal.chaal.amount) {
           act(socket, roomId, 'CHAAL');

@@ -187,8 +187,8 @@ export function Table({ roomId }: { roomId: string }) {
             )}
             {round?.sideShow && round.state === 'SIDE_SHOW_PENDING' && (
               <div className="notice notice--warn">
-                <strong>{round.sideShow.initiatorName}</strong> requested a side show with{' '}
-                <strong>{round.sideShow.targetName}</strong>. Betting is paused.
+                <strong>{round.sideShow.initiatorName}</strong> bet and asked{' '}
+                <strong>{round.sideShow.targetName}</strong> for a side show. Betting is paused.
                 {me?.userId === round.sideShow.targetUserId ? (
                   <div className="row">
                     <button className="btn btn--small btn--primary" onClick={() => send('RESPOND_SIDE_SHOW', { accept: true })}>
@@ -390,15 +390,17 @@ export function Table({ roomId }: { roomId: string }) {
                 ) : (
                   <button
                     className="btn btn--ghost"
-                    disabled={!round.lastBettorUserId || round.lastBettorUserId === me.userId}
+                    disabled={!round.sideShowAllowed}
                     title={
-                      round.lastBettorUserId === me.userId
-                        ? 'You made the last bet, so somebody else has to ask you'
-                        : 'A side show goes to the player who made the last bet'
+                      round.sideShowBlockedReason ??
+                      'Your bet is placed first, then the request goes to the player before you'
                     }
                     onClick={() => send('SIDE_SHOW')}
                   >
-                    Request side show{round.lastBettorName ? ` with ${round.lastBettorName}` : ''}
+                    {me.legal
+                      ? `Bet ${me.legal.chaal.amount} & request side show`
+                      : 'Request side show'}
+                    {round.sideShowTargetName ? ` with ${round.sideShowTargetName}` : ''}
                   </button>
                 )}
                 {!round.muflis && room.rules.allowMidRoundMuflis && (

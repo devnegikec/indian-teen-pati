@@ -181,6 +181,12 @@ export interface RoundView {
   /** The player who made the last bet — a side show is offered to them. */
   lastBettorUserId: string | null;
   lastBettorName: string | null;
+  /** The player a side-show request from *you* would go to (previous seen seat). */
+  sideShowTargetUserId: string | null;
+  sideShowTargetName: string | null;
+  /** Whether *you* may ask for a side show right now, and why not if you cannot. */
+  sideShowAllowed: boolean;
+  sideShowBlockedReason: string | null;
   /** Set while the last standing player decides whether to show their cards. */
   survivorUserId: string | null;
   survivorName: string | null;

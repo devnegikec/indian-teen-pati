@@ -28,8 +28,8 @@ function setup(rules: Partial<RoomRules> = {}, players = 3): Ctx {
   return { db, game, roomId: room.id, admin, bob, cara };
 }
 
-function view(ctx: Ctx, who: { userId: string }): RoomView {
-  return ctx.game.roomView(ctx.roomId, who.userId);
+function view(ctx: Ctx, who: { userId: string } | string): RoomView {
+  return ctx.game.roomView(ctx.roomId, typeof who === 'string' ? who : who.userId);
 }
 
 function totalChips(ctx: Ctx): number {
@@ -37,8 +37,18 @@ function totalChips(ctx: Ctx): number {
   return rows.reduce((sum, r) => sum + r.chips, 0);
 }
 
-function pot(ctx: Ctx, who: { userId: string }): number {
+function pot(ctx: Ctx, who: { userId: string } | string): number {
   return view(ctx, who).round?.pot ?? 0;
+}
+
+/** Active players in betting order, starting with the player on turn. */
+function order(ctx: Ctx): string[] {
+  const round = view(ctx, ctx.admin).round!;
+  const active = view(ctx, ctx.admin)
+    .players.filter((p) => p.inRound && !p.folded)
+    .sort((a, b) => a.seat - b.seat);
+  const start = active.findIndex((p) => p.seat === round.turnSeat);
+  return active.map((_, i) => active[(start + i) % active.length].userId);
 }
 
 describe('round start, boot and chip integrity', () => {
@@ -241,61 +251,94 @@ describe('assumed card modes', () => {
     expect(() =>
       ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'SHOW', { targetUserId: ctx.cara.userId }),
     ).toThrow(/two players are left/i);
-    // the side show goes to the player who made the last bet
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {}); // bob (first to act) bets
-    const target = view(ctx, ctx.cara).round?.lastBettorUserId;
-    expect(target).toBe(ctx.bob.userId);
-    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'SIDE_SHOW', {});
+
+    // A = on turn, B = next, C = the player before A
+    const [a, b, c] = order(ctx);
+
+    // a blind player must look at their cards first
+    expect(() => ctx.game.handleAction(ctx.roomId, a, 'SIDE_SHOW', {})).toThrow(/See .*cards/i);
+    // and you can only ask on your own turn
+    expect(() => ctx.game.handleAction(ctx.roomId, b, 'SIDE_SHOW', {})).toThrow(/your own turn/i);
+
+    ctx.game.handleAction(ctx.roomId, a, 'SEE_CARDS', {});
+    ctx.game.handleAction(ctx.roomId, a, 'CHAAL', {});
+    ctx.game.handleAction(ctx.roomId, b, 'CHAAL', {}); // B stays blind
+    const potBeforeC = pot(ctx, ctx.admin);
+    ctx.game.handleAction(ctx.roomId, c, 'SEE_CARDS', {});
+    // C's neighbour is the blind B, so C cannot ask for a side show
+    expect(() => ctx.game.handleAction(ctx.roomId, c, 'SIDE_SHOW', {})).toThrow(/has not seen their cards/i);
+    ctx.game.handleAction(ctx.roomId, c, 'CHAAL', {});
+
+    // A is seen, on turn, and the player before A (C) is seen too
+    const potBeforeAsk = pot(ctx, ctx.admin);
+    expect(potBeforeC).toBeGreaterThan(0);
+    const offeredTo = view(ctx, a).round?.sideShowTargetUserId;
+    expect(offeredTo).toBe(c);
+    expect(view(ctx, a).round?.sideShowAllowed).toBe(true);
+    ctx.game.handleAction(ctx.roomId, a, 'SIDE_SHOW', {});
     expect(view(ctx, ctx.admin).round?.state).toBe('SIDE_SHOW_PENDING');
-    expect(view(ctx, ctx.admin).round?.sideShow?.targetUserId).toBe(ctx.bob.userId);
+    expect(view(ctx, ctx.admin).round?.sideShow?.targetUserId).toBe(c);
+    // the request places the bet first
+    expect(pot(ctx, ctx.admin)).toBeGreaterThan(potBeforeAsk);
     expect(() => ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'CHAAL', {})).toThrow();
+
     // nothing is revealed until the request is accepted
-    const pending = view(ctx, ctx.bob);
-    expect(pending.players.find((p) => p.userId === ctx.cara.userId)!.cards.every((c) => c.hidden)).toBe(true);
+    const pending = view(ctx, c);
+    expect(pending.players.find((p) => p.userId === a)!.cards.every((card) => card.hidden)).toBe(true);
     expect(pending.round?.sideShow?.result).toBeNull();
     // only the invited player may answer
-    expect(() => ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'RESPOND_SIDE_SHOW', { accept: true })).toThrow(
+    expect(() => ctx.game.handleAction(ctx.roomId, b, 'RESPOND_SIDE_SHOW', { accept: true })).toThrow(
       /invited/i,
     );
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'RESPOND_SIDE_SHOW', { accept: true });
+    ctx.game.handleAction(ctx.roomId, c, 'RESPOND_SIDE_SHOW', { accept: true });
     const v = view(ctx, ctx.admin);
     expect(v.round?.state).toBe('BETTING');
     expect(v.round?.sideShow?.status).toBe('ACCEPTED');
     // exactly one of the two participants folded
     const folded = v.players.filter((p) => p.folded).map((p) => p.userId);
     expect(folded.length).toBe(1);
-    expect([ctx.bob.userId, ctx.cara.userId]).toContain(folded[0]);
+    expect([a, c]).toContain(folded[0]);
     // a side show means both players have effectively seen their cards
-    expect(v.players.find((p) => p.userId === ctx.bob.userId)!.blind).toBe(false);
-    expect(v.players.find((p) => p.userId === ctx.cara.userId)!.blind).toBe(false);
-    // the two participants can see each other's cards, the third player cannot
-    const bobView = view(ctx, ctx.bob);
-    const caraCards = bobView.players.find((p) => p.userId === ctx.cara.userId)!.cards;
-    expect(caraCards.every((c) => c.hidden)).toBe(false);
-    expect(bobView.round?.sideShow?.result).not.toBeNull();
-    expect(bobView.round?.sideShow?.result?.hands.length).toBe(2);
+    expect(v.players.find((p) => p.userId === a)!.blind).toBe(false);
+    expect(v.players.find((p) => p.userId === c)!.blind).toBe(false);
 
-    const adminView = view(ctx, ctx.admin);
-    expect(adminView.players.find((p) => p.userId === ctx.cara.userId)!.cards.every((c) => c.hidden)).toBe(true);
-    expect(adminView.players.find((p) => p.userId === ctx.bob.userId)!.cards.every((c) => c.hidden)).toBe(true);
+    // the two participants can see each other's cards, the third player cannot
+    const aView = view(ctx, a);
+    const cCards = aView.players.find((p) => p.userId === c)!.cards;
+    expect(cCards.every((card) => card.hidden)).toBe(false);
+    expect(aView.round?.sideShow?.result).not.toBeNull();
+    expect(aView.round?.sideShow?.result?.hands.length).toBe(2);
+
+    const bView = view(ctx, b);
+    expect(bView.players.find((p) => p.userId === c)!.cards.every((card) => card.hidden)).toBe(true);
     // outsiders only get a plain announcement: no hands, no hand classes
-    expect(adminView.round?.sideShow?.result).toBeNull();
-    expect(adminView.round?.sideShow?.announcement).toMatch(/side show/i);
-    expect(adminView.round?.sideShow?.announcement).not.toMatch(/high card|trail|colour|pair|sequence/i);
-    expect(adminView.round?.log.some((l) => /high card|trail|colour|pair|sequence/i.test(l.text))).toBe(false);
+    expect(bView.round?.sideShow?.result).toBeNull();
+    expect(bView.round?.sideShow?.announcement).toMatch(/side show/i);
+    expect(bView.round?.sideShow?.announcement).not.toMatch(/high card|trail|colour|pair|sequence/i);
+    expect(bView.round?.log.some((l) => /high card|trail|colour|pair|sequence/i.test(l.text))).toBe(false);
   });
 
-  it('resumes betting when a side show is declined', () => {
+  it('resumes betting on the next player when a side show is declined', () => {
     const ctx = setup();
     ctx.game.handleAction(ctx.roomId, ctx.admin.userId, 'START_ROUND', {});
-    // the side show is offered to the player who made the last bet
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'CHAAL', {});
-    ctx.game.handleAction(ctx.roomId, ctx.cara.userId, 'SIDE_SHOW', {});
-    ctx.game.handleAction(ctx.roomId, ctx.bob.userId, 'RESPOND_SIDE_SHOW', { accept: false });
+    const [a, b, c] = order(ctx);
+    ctx.game.handleAction(ctx.roomId, a, 'SEE_CARDS', {});
+    ctx.game.handleAction(ctx.roomId, a, 'CHAAL', {});
+    ctx.game.handleAction(ctx.roomId, b, 'SEE_CARDS', {});
+    ctx.game.handleAction(ctx.roomId, b, 'CHAAL', {});
+    ctx.game.handleAction(ctx.roomId, c, 'SEE_CARDS', {});
+    ctx.game.handleAction(ctx.roomId, c, 'CHAAL', {});
+    // A is back on turn and C (the player before them) has seen their cards
+    ctx.game.handleAction(ctx.roomId, a, 'SIDE_SHOW', {});
+    expect(view(ctx, ctx.admin).round?.state).toBe('SIDE_SHOW_PENDING');
+    ctx.game.handleAction(ctx.roomId, c, 'RESPOND_SIDE_SHOW', { accept: false });
     const v = view(ctx, ctx.admin);
     expect(v.round?.state).toBe('BETTING');
     expect(v.round?.sideShow?.status).toBe('DECLINED');
     expect(v.players.some((p) => p.folded)).toBe(false);
+    // the turn has moved on to the next player
+    const nextSeat = v.players.find((p) => p.userId === b)!.seat;
+    expect(v.round?.turnSeat).toBe(nextSeat);
   });
 });
 
